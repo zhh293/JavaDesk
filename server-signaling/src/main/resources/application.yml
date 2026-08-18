@@ -1,0 +1,70 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: rc-server-signaling
+  # dev 默认：H2 内存库，零外部依赖即可自测；prod 见 application-prod.yml
+  datasource:
+    url: jdbc:h2:mem:rc_remote;MODE=MySQL;DATABASE_TO_LOWER=TRUE;NON_KEYWORDS=USER,SESSION;DB_CLOSE_DELAY=-1
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+  sql:
+    init:
+      mode: embedded   # 仅内嵌库自动执行 schema.sql；prod 置 never
+  h2:
+    console:
+      enabled: true
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 0
+  security:
+    oauth2:
+      client:
+        registration:
+          enterprise-sso:
+            # 企业 SSO / OIDC 授权码流配置（Phase 3 落地，当前不生效）
+            provider: enterprise
+            client-id: change-me
+            client-secret: change-me
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            scope: openid,profile,email
+        provider:
+          enterprise:
+            issuer-uri: https://sso.example.com
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+
+# 信令长连接（Netty）与安全配置
+rc:
+  signaling:
+    port: 8443
+    tls: true                 # dev 无证书时自动自签
+    node-id: node-1
+    device-ttl-seconds: 60    # 在线设备 TTL / 读空闲判死
+    heartbeat-db-flush-seconds: 30
+    relay-host: 127.0.0.1     # 中继服务器地址（Phase 1 静态单节点）
+    relay-port: 9090
+    relay-secret: ${RC_RELAY_SECRET:rc-relay-dev-secret-change-me}
+  security:
+    jwt-secret: ${RC_JWT_SECRET:rc-signaling-dev-secret-change-me-in-prod-0123456789}
+    access-token-ttl-seconds: 900
+    refresh-token-ttl-seconds: 604800
+    # SSO/OIDC 登录成功后重定向回前端回调地址（携带 JWT query 参数）
+    sso-redirect-uri: ${RC_SSO_REDIRECT_URI:http://localhost:3000/sso/callback}

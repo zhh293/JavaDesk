@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package com.rc.common.protocol;
+
+option java_package = "com.rc.common.protocol";
+option java_multiple_files = true;
+option java_outer_classname = "SignalProto";
+option optimize_for = SPEED;
+
+// ============================================================
+// 控制面信令协议（Protobuf over TCP/TLS）
+// 所有消息统一包在 Signal 信封里，session_id/seq/timestamp 用于
+// 会话路由、防重放幂等与链路追踪。
+// ============================================================
+
+// 传输路径类型（对应降级阶梯）
+enum PathType {
+  PATH_UNKNOWN = 0;
+  P2P = 1;         // P2P 直连
+  RELAY_UDP = 2;   // UDP 中继
+  RELAY_TCP = 3;   // TCP/TLS 中继
+  RELAY_WS = 4;    // WebSocket(443) 中继
+}
+
+// ICE 候选类型
+enum CandidateType {
+  CAND_HOST = 0;   // 本地网卡
+  CAND_SRFLX = 1;  // STUN 服务器反射
+  CAND_RELAY = 2;  // TURN/中继分配
+}
+
+// NAT 类型（RFC 5780 思路推断，用于打洞成功率预判）
+enum NatType {
+  NAT_UNKNOWN = 0;
+  NAT_OPEN = 1;                   // 公网直连，无 NAT
+  NAT_FULL_CONE = 2;              // 全锥形
+  NAT_RESTRICTED_CONE = 3;        // 受限锥形
+  NAT_PORT_RESTRICTED_CONE = 4;   // 端口受限锥形
+  NAT_SYMMETRIC = 5;              // 对称
+}
+
+message Endpoint {
+  string ip = 1;
+  int32 port = 2;
+}
+
+// 统一信令信封
+message Signal {
+  uint64 session_id = 1;   // 会话 ID（0 表示未绑定会话的全局消息）
+  uint32 seq = 2;          // 严格递增序号，服务端幂等去重
+  uint64 timestamp = 3;    // 发送方毫秒时间戳
+  string trace_id = 4;     // 全链路追踪 ID
+
+  oneof body {
+    RegisterReq register_req = 10;
+    RegisterResp register_resp = 11;
+    Heartbeat heartbeat = 12;
+
+    InviteReq invite_req = 20;
+    InviteResp invite_resp = 21;
+
+    CandidateMsg candidate_msg = 30;
+
+    RelayAllocReq relay_alloc_req = 40;
+    RelayAllocResp relay_alloc_resp = 41;
+
+    PathSwitchNotify path_switch = 50;
+
+    SessionEnd session_end = 60;
+  }
+}
+
+// ---------- 设备上线 ----------
+
+message RegisterReq {
+  string device_code = 1;             // 对外连接码
+  string device_name = 2;
+  string os = 3;
+  string version = 4;
+  string public_key_fingerprint = 5;  // 设备公钥指纹（防伪造校验）
+  NatType nat_type = 6;               // 上报推断的 NAT 类型
+  string token = 7;                   // JWT 访问令牌（长连接鉴权，来自 REST 登录）
+  string public_key = 8;              // 设备公钥（Base64 X.509，E2EE 邀请流用）
+}
+
+message RegisterResp {
+  bool ok = 1;
+  int32 error_code = 2;
+  string error_message = 3;
+  uint64 device_id = 4;
+  string signaling_node_id = 5;       // 承载本连接的信令节点 ID
+  int64 server_time = 6;              // 服务端时间（时间同步）
+}
+
+message Heartbeat {
+  uint64 device_id = 1;
+  uint32 seq = 2;
+  int64 client_time = 3;
+  uint32 rtt_ms = 4;                  // 最近一次信令 RTT
+  float loss_rate = 5;                // 信令丢包率
+}
+
+// ---------- 会话邀请（含 E2EE 连接密码） ----------
+
+message InviteReq {
+  uint64 session_id = 1;
+  string controller_device_code = 2;  // 发起方
+  string target_device_code = 3;      // 被控端
+  bytes encrypted_password = 4;       // 被控端公钥 RSA-OAEP 加密的(连接密码 + 会话熵)
+}
+
+message InviteResp {
+  uint64 session_id = 1;
+  bool accepted = 2;
+  int32 error_code = 3;
+  string error_message = 4;
+}
+
+// ---------- ICE 候选交换 ----------
+
+message CandidateMsg {
+  uint64 session_id = 1;
+  CandidateType type = 2;
+  string ip = 3;
+  int32 port = 4;
+  uint32 priority = 5;
+  string ufrag = 6;                   // ICE username fragment
+  string password = 7;                // ICE 凭据
+  string sdp_mid = 8;
+  int32 sdp_mline_index = 9;
+}
+
+// ---------- 中继分配 ----------
+
+message RelayAllocReq {
+  uint64 session_id = 1;
+  string region = 2;                  // 期望区域（可选）
+  PathType path_type = 3;             // 期望中继协议（RELAY_UDP/TCP/WS，随降级阶梯下探）
+}
+
+message RelayAllocResp {
+  uint64 session_id = 1;
+  bool ok = 2;
+  int32 error_code = 3;
+  string error_message = 4;
+  string relay_host = 5;
+  int32 relay_port = 6;
+  string token = 7;                   // 一次性短 TTL 会话令牌
+  int64 token_ttl_seconds = 8;
+  PathType path_type = 9;
+  bool tls = 10;                      // 中继端点是否 TLS（RELAY_TCP/RELAY_WS 时有效）
+}
+
+// ---------- 降级 / 回切通知 ----------
+
+message PathSwitchNotify {
+  uint64 session_id = 1;
+  PathType from_path = 2;
+  PathType to_path = 3;
+  string reason = 4;
+}
+
+// ---------- 会话结束 ----------
+
+message SessionEnd {
+  uint64 session_id = 1;
+  string reason = 2;
+  int32 error_code = 3;
+}
