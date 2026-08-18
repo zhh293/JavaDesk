@@ -50,6 +50,9 @@
         <jna.version>5.14.0</jna.version>
         <jcodec.version>0.2.5</jcodec.version>
 
+        <!-- 本地缓存（文件传输接收上下文生命周期管理） -->
+        <caffeine.version>3.1.8</caffeine.version>
+
         <!-- 日志 -->
         <slf4j.version>2.0.13</slf4j.version>
 
@@ -163,6 +166,13 @@
                 <groupId>org.jcodec</groupId>
                 <artifactId>jcodec-javase</artifactId>
                 <version>${jcodec.version}</version>
+            </dependency>
+
+            <!-- Caffeine（文件传输接收上下文缓存，expireAfterAccess 自动清理半截传输） -->
+            <dependency>
+                <groupId>com.github.ben-manes.caffeine</groupId>
+                <artifactId>caffeine</artifactId>
+                <version>${caffeine.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

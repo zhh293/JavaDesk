@@ -155,11 +155,19 @@ public final class RemoteControlClient implements ClientConnectionManager.Sessio
 
     // ---------- 数据面操作 ----------
 
-    /** 发送本地文件给对端（双向）。 */
+    /** 发送本地文件给对端（双向），落到对端默认接收目录。 */
     public void sendFile(Path file) {
         FileTransferService ft = fileTransfer;
         if (ft != null) {
             ft.sendFile(file);
+        }
+    }
+
+    /** 发送本地文件，指定对端相对保存路径（可含子目录，空则用文件名）。 */
+    public void sendFile(Path file, String targetPath) {
+        FileTransferService ft = fileTransfer;
+        if (ft != null) {
+            ft.sendFile(file, targetPath);
         }
     }
 
@@ -322,6 +330,9 @@ public final class RemoteControlClient implements ClientConnectionManager.Sessio
         if (clipboard != null) {
             clipboard.close();
             clipboard = null;
+        }
+        if (fileTransfer != null) {
+            fileTransfer.close();
         }
     }
 

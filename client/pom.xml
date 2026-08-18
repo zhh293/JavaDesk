@@ -84,5 +84,11 @@
             <groupId>org.jcodec</groupId>
             <artifactId>jcodec-javase</artifactId>
         </dependency>
+
+        <!-- Caffeine（文件传输接收上下文缓存） -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
     </dependencies>
 </project>
