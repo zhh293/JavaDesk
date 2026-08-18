@@ -22,12 +22,17 @@ public final class InputController {
 
     private static final Logger log = LoggerFactory.getLogger(InputController.class);
 
-    private final TransportChannel channel;
+    private volatile TransportChannel channel;
     private volatile double scaleX = 1.0;
     private volatile double scaleY = 1.0;
     private volatile boolean enabled = true;
 
     public InputController(TransportChannel channel) {
+        this.channel = channel;
+    }
+
+    /** 回切换通道后重绑底层 channel（保持同一实例，UI attach 无需重做）。 */
+    public void rebind(TransportChannel channel) {
         this.channel = channel;
     }
 

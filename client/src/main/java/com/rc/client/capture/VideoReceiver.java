@@ -156,6 +156,11 @@ public final class VideoReceiver implements TransportListener {
 
     @Override
     public void onClosed(Throwable cause) {
+        close();
+    }
+
+    /** 显式关闭（幂等），停止 NACK 定时扫描并清空重组缓冲。 */
+    public void close() {
         timer.shutdownNow();
         frames.clear();
     }

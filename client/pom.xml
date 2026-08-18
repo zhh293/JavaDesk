@@ -64,5 +64,25 @@
             <groupId>tech.kwik</groupId>
             <artifactId>kwik</artifactId>
         </dependency>
+
+        <!-- DXGI Desktop Duplication 原生抓屏（Phase 2） -->
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna-platform</artifactId>
+        </dependency>
+
+        <!-- H.264 纯 Java 软编（Phase 2，硬编前的可用实现） -->
+        <dependency>
+            <groupId>org.jcodec</groupId>
+            <artifactId>jcodec</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.jcodec</groupId>
+            <artifactId>jcodec-javase</artifactId>
+        </dependency>
     </dependencies>
 </project>

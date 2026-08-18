@@ -2,9 +2,11 @@ package com.rc.client.app;
 
 import com.rc.client.audio.AudioReceiver;
 import com.rc.client.audio.AudioStreamer;
-import com.rc.client.capture.ScreenCapturer;
+import com.rc.client.capture.DesktopDuplicationCapturer;
+import com.rc.client.capture.DxgiDesktopDuplicationCapturer;
+import com.rc.client.capture.MotionJpegVideoCodec;
 import com.rc.client.capture.ScreenStreamer;
-import com.rc.client.capture.VideoFrameReceiver;
+import com.rc.client.capture.VideoReceiver;
 import com.rc.client.clipboard.ClipboardService;
 import com.rc.client.control.InputController;
 import com.rc.client.control.InputInjector;
@@ -80,6 +82,7 @@ public final class RemoteControlClient implements ClientConnectionManager.Sessio
     private volatile FileTransferService fileTransfer;
     private volatile ClipboardService clipboard;
     private volatile AudioReceiver audioReceiver;
+    private volatile VideoReceiver videoReceiver;
 
     public RemoteControlClient(String baseUrl,
                                SignalingClientConfig signalingConfig,
@@ -214,6 +217,22 @@ public final class RemoteControlClient implements ClientConnectionManager.Sessio
     }
 
     @Override
+    public void onChannelSwitched(TransportChannel newChannel, boolean controller) {
+        rebindDataPlane(newChannel, controller);
+    }
+
+    /** 回切（make-before-break）后把数据面业务重绑到新 channel，并强制关键帧重启解码。 */
+    private void rebindDataPlane(TransportChannel newChannel, boolean controller) {
+        closeDataPlaneServices();
+        this.channel = newChannel;
+        this.controller = controller;
+        setupDataPlane(newChannel, controller);
+        if (!controller && screenStreamer != null) {
+            screenStreamer.requestKeyFrame();
+        }
+    }
+
+    @Override
     public void onInvite(String controllerDeviceCode, long sessionId) {
         uiListener.onInvite(controllerDeviceCode, sessionId);
     }
@@ -249,14 +268,20 @@ public final class RemoteControlClient implements ClientConnectionManager.Sessio
         ch.addListener(fileTransfer);
 
         if (controller) {
-            inputController = new InputController(ch);
-            ch.addListener(new VideoFrameReceiver(uiListener::onVideoFrame));
+            if (inputController == null) {
+                inputController = new InputController(ch);
+            } else {
+                inputController.rebind(ch);
+            }
+            videoReceiver = new VideoReceiver(ch, new MotionJpegVideoCodec(),
+                    (img, pts) -> uiListener.onVideoFrame(img));
+            ch.addListener(videoReceiver);
             audioReceiver = new AudioReceiver();
             ch.addListener(audioReceiver);
         } else {
             try {
-                ScreenCapturer capturer = ScreenCapturer.create();
-                screenStreamer = new ScreenStreamer(ch, capturer);
+                DesktopDuplicationCapturer capturer = createCapturer();
+                screenStreamer = new ScreenStreamer(ch, capturer, new MotionJpegVideoCodec());
                 screenStreamer.start();
             } catch (Exception e) {
                 log.warn("screen capture unavailable, streaming disabled: {}", e.getMessage());
@@ -271,6 +296,17 @@ public final class RemoteControlClient implements ClientConnectionManager.Sessio
     }
 
     private void cleanupDataPlane() {
+        closeDataPlaneServices();
+        channel = null;
+        controller = false;
+        inputController = null;
+        inputInjector = null;
+        fileTransfer = null;
+        audioReceiver = null;
+    }
+
+    /** 关闭持有独立资源的数据面服务（供会话结束与回切重绑复用）。 */
+    private void closeDataPlaneServices() {
         if (screenStreamer != null) {
             screenStreamer.close();
             screenStreamer = null;
@@ -279,16 +315,20 @@ public final class RemoteControlClient implements ClientConnectionManager.Sessio
             audioStreamer.close();
             audioStreamer = null;
         }
+        if (videoReceiver != null) {
+            videoReceiver.close();
+            videoReceiver = null;
+        }
         if (clipboard != null) {
             clipboard.close();
             clipboard = null;
         }
-        channel = null;
-        controller = false;
-        inputController = null;
-        inputInjector = null;
-        fileTransfer = null;
-        audioReceiver = null;
+    }
+
+    /** 选择屏幕采集实现（Phase 2：DXGI 原生优先，失败回退 AWT）。 */
+    private DesktopDuplicationCapturer createCapturer() {
+        DxgiDesktopDuplicationCapturer dxgi = DxgiDesktopDuplicationCapturer.tryCreate();
+        return dxgi != null ? dxgi : DesktopDuplicationCapturer.awtFallback();
     }
 
     /** 退出时统一回收。 */

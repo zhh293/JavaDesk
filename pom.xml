@@ -46,6 +46,10 @@
         <!-- QUIC（Phase 2，kwik 纯 Java QUIC v1） -->
         <kwik.version>0.9.3</kwik.version>
 
+        <!-- 采集/编码（Phase 2 富媒体：DXGI 抓屏 + H.264 软编） -->
+        <jna.version>5.14.0</jna.version>
+        <jcodec.version>0.2.5</jcodec.version>
+
         <!-- 日志 -->
         <slf4j.version>2.0.13</slf4j.version>
 
@@ -135,6 +139,30 @@
                 <groupId>tech.kwik</groupId>
                 <artifactId>kwik</artifactId>
                 <version>${kwik.version}</version>
+            </dependency>
+
+            <!-- JNA（DXGI Desktop Duplication 原生抓屏，Phase 2） -->
+            <dependency>
+                <groupId>net.java.dev.jna</groupId>
+                <artifactId>jna</artifactId>
+                <version>${jna.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.java.dev.jna</groupId>
+                <artifactId>jna-platform</artifactId>
+                <version>${jna.version}</version>
+            </dependency>
+
+            <!-- JCodec（H.264 纯 Java 软编，硬编前的可用实现，Phase 2） -->
+            <dependency>
+                <groupId>org.jcodec</groupId>
+                <artifactId>jcodec</artifactId>
+                <version>${jcodec.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.jcodec</groupId>
+                <artifactId>jcodec-javase</artifactId>
+                <version>${jcodec.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

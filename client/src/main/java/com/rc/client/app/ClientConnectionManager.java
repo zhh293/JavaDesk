@@ -81,6 +81,10 @@ public final class ClientConnectionManager {
         default void onPathChanged(PathType pathType, ChannelInfo info) {
         }
 
+        /** 数据面通道切换（make-before-break 回切），上层据此把业务重绑到新 channel。 */
+        default void onChannelSwitched(TransportChannel channel, boolean controller) {
+        }
+
         /** 收到被控邀请（仅被控端），UI 据此弹确认框后调用 {@link ClientConnectionManager#acceptInvite}。 */
         default void onInvite(String controllerDeviceCode, long sessionId) {
         }
@@ -709,6 +713,7 @@ public final class ClientConnectionManager {
             QosMetrics.increment(QosMetricNames.SWITCHBACK_TOTAL);
             log.info("switchback committed, session={}", ctx.sessionId);
             sessionListener.onPathChanged(PathType.P2P, channel.info());
+            sessionListener.onChannelSwitched(channel, ctx.role == Role.CONTROLLER);
             if (old != null) {
                 old.close();
             }
