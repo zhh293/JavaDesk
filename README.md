@@ -1,6 +1,6 @@
 # JavaDesk
 
-> 生产级远程控制软件（类 ToDesk / 向日葵 / RustDesk），Java 17 + Netty 实现。
+> 面向生产架构演进的远程控制软件（类 ToDesk / 向日葵 / RustDesk），Java 17 + Netty 实现。
 > 核心链路：**P2P 直连优先 → 服务端会话级路由仲裁 → 中继转发兜底**，控制面 / 数据面分离。
 >
 > 当前运行主链已统一到 V2：连接 fencing、共享会话/路由 CAS、Redis Streams 跨节点投递、
@@ -9,7 +9,6 @@
 
 [![Java](https://img.shields.io/badge/Java-17%20(LTS)-orange.svg)](#)
 [![Netty](https://img.shields.io/badge/Netty-4.1.115-blue.svg)](#)
-[![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](#)
 
 ---
 
@@ -43,10 +42,10 @@ JavaDesk 旨在从零实现一款**可自托管、端到端加密（E2EE）、P2
 
 | 原则 | 说明 |
 |------|------|
-| 控制面 / 数据面分离 | 信令（低带宽强一致）与流媒体（高带宽低时延）解耦，独立扩缩容 |
+| 控制面 / 数据面分离 | 信令（低带宽、权威状态 CAS）与流媒体（高带宽低时延）解耦，独立扩缩容 |
 | P2P 优先、中继兜底 | 直连省成本、低时延；中继是可达性底线，不假设打洞 100% 成功 |
 | 端到端加密 | 信令与中继只做密文透传，不接触密钥与明文 |
-| 降级自动、业务无感 | 路径切换对上层透明，会话 ID 不变 |
+| 降级受控、绑定稳定 | 客户端监控触发上报，服务端统一选路；成功 COMMIT 时上层绑定和会话 ID 不变 |
 
 ---
 
@@ -54,16 +53,16 @@ JavaDesk 旨在从零实现一款**可自托管、端到端加密（E2EE）、P2
 
 - **P2P 直连**：STUN 探测 + ICE 候选收集 + UDP 打洞 + 端口预测（对称 NAT 场景）。
 - **服务端统一路由仲裁**：候选集可以最终一致，但会话路径必须经 `PREPARE → 双端 READY → COMMIT`，用 `routeEpoch` 防脑裂。
-- **全自动降级阶梯**：`P2P-QUIC/UDP → Relay-UDP → Relay-TCP/TLS → Relay-WS → Ended`，V2 中客户端只执行服务端 assignment，不自主换 relay。
-- **无损迁移**：新 Relay 先 JOIN，两端 READY 后服务端 COMMIT，旧路径最后 RETIRE；任何一端都不能单方面快进 epoch。
+- **服务端权威降级**：P2P 失败或运行期 QoS 告警后，服务端优先选择 Relay-UDP；当前协议无可用节点时再尝试 Relay-TCP/TLS、Relay-WS。客户端只执行 assignment，不自主换 relay。
+- **Make-before-break 迁移**：新 Relay 先 JOIN，两端 READY 后服务端 COMMIT，旧路径最后 RETIRE；任何一端都不能单方面快进 epoch。旧路径已物理中断时不承诺零断流。
 - **端到端加密**：`SecureTransportChannel` 使用方向隔离的 AES-256-GCM epoch key、确定性唯一 nonce 与重放窗口；relay 只看到最小 outer frame。
 - **QUIC 传输层**：kwik（纯 Java QUIC v1），stream 跑可靠通道、datagram 跑实时帧。
 - **多通道复用**：单 socket / 中继流上以 1 Byte channel 头复用控制 / 视频 / 音频 / 文件 / 剪贴板。
 - **富媒体能力**：屏幕采集推流（JPEG 占位 + H.264 管线骨架）、键鼠远控、文件互传、双向剪贴板、实时音频。
-- **智能 QoS**：PING/PONG 心跳真实测 RTT/丢包，EWMA 基线 + 滑动窗口 σ 动态阈值，替代固定门限。
-- **多地域中继**：Nacos 管 ephemeral 实例和静态端口能力，Redis 管连接数、CPU、带宽、direct-memory 与网络维度 EWMA，信令按 region/provider/path 综合择优。
+- **实时 QoS 触发**：客户端 PING/PONG 测量 RTT/丢包；持续丢包、动态 PONG 静默门限或 transport close/reset 触发迁移上报。当前高 RTT 本身不触发降级。
+- **多地域中继**：Nacos 管 ephemeral 实例和静态端口能力，Redis 管连接数、CPU、带宽、direct-memory 与网络维度 EWMA。Redis 画像只参与下一节点择优，不主动触发当前会话降级。
 - **企业级认证与合规**：JWT（角色权限 ROLE_ADMIN）、SSO/OIDC 授权码流、异步审计流水（落库 + 导出归档）。
-- **可观测**：Micrometer + Prometheus，三端统一暴露指标（在线设备 / 活跃会话 / 字节计数 / 打洞成功率）。
+- **可观测**：信令通过 Actuator、Relay 通过独立 HTTP 端点暴露 Prometheus 指标；客户端记录 Micrometer 进程内指标，但当前没有抓取端点。
 
 ---
 
@@ -82,6 +81,9 @@ JavaDesk 旨在从零实现一款**可自托管、端到端加密（E2EE）、P2
             │ MySQL + Redis │ │  STUN  │  │  中继服务器集群    │
             │ lease/session │ │ coturn │  │ epoch/role 席位   │
             └───────────────┘ └────────┘  └──────────────────┘
+                     ▲                            │
+                     │ 高频运行画像              │ ephemeral 注册
+                     └────────── Nacos ──────────┘
 
   控制端 (Controller)                   被控端 (Agent)
        │  ① P2P 打洞直连 (QUIC/UDP)        │
@@ -98,8 +100,8 @@ JavaDesk 旨在从零实现一款**可自托管、端到端加密（E2EE）、P2
 2. 客户端经 Netty 长连接上报设备（设备码、公钥指纹、NAT 类型），保持心跳；
 3. 控制端发起邀请，连接密码经被控端公钥加密后经信令透传；
 4. 被控端解密校验并确认，双方经 STUN/ICE 收集候选并 UDP 打洞；
-5. 打洞成功建立 P2P；失败时任一端提交 `RelaySwitchRequest(baseEpoch)`，服务端只选择一个 relay，并向两端下发同 assignment 的角色票据；
-6. 两端 JOIN 并报告 READY，只有双 READY 才 COMMIT；客户端在 `SwitchableTransportChannel` 下原子换路，再退役旧路径；
+5. 打洞失败时客户端发送 `RelayAllocReq`；运行期丢包/静默/断链或 assignment 连接失败时发送 `RelayFailureReport`；
+6. 服务端结合 Nacos 候选与 Redis 画像选择一个 relay，向两端下发同一 assignment 的角色票据；两端 JOIN 并报告 READY，只有双 READY 才 COMMIT；客户端在 `SwitchableTransportChannel` 下原子换路，再退役旧路径；
 7. 信令重连后通过 lease fencing 与 session snapshot 对账；过期通知、旧 epoch 和旧连接不能覆盖当前事实。
 
 ---
@@ -117,7 +119,7 @@ JavaDesk 旨在从零实现一款**可自托管、端到端加密（E2EE）、P2
 | 服务端框架 | Spring Boot 3.2.5 + MyBatis | 仅 server-signaling |
 | 存储 | MySQL 8 + Redis 集群 | dev 默认 H2 内存库零依赖自测 |
 | GUI | JavaFX 21.0.2 | 桌面客户端 |
-| 可观测 | Micrometer + Prometheus | 三端统一指标 |
+| 可观测 | Micrometer + Prometheus | 信令与 Relay 提供抓取端点；客户端仅进程内指标 |
 
 ---
 
@@ -144,8 +146,8 @@ remote-control/
 │       ├── signaling/               # SignalingClient(长连接)/AuthApiClient(REST)/DeviceInfoClient
 │       ├── ice/                     # StunCodec/StunClient/NatTypeDetector/CandidateGatherer/PortPredictor/IceAgent/UdpSocket
 │       ├── transport/               # 原始路径 + SwitchableTransportChannel + SecureTransportChannel
-│       ├── session/                 # SessionActor / 纯 reducer / epoch 事件
-│       ├── relay/                   # 只执行指定 assignment 的 RelayClusterInvoker
+│       ├── session/                 # SessionActor / 纯 reducer / epoch 事件（已测试，尚未接入运行主链）
+│       ├── relay/                   # RelayClusterInvoker 辅助模型（已测试，运行主链由 ConnectionManager 执行）
 │       ├── capture/                 # ScreenCapturer/ScreenCodec/ScreenStreamer + H.264 管线(VideoCodec/FecCodec/VideoSender/Receiver)
 │       ├── control/                 # ControlCodec/InputController(采集)/InputInjector(注入)
 │       ├── file/                    # FileTransferCodec/FileTransferService
@@ -191,7 +193,7 @@ remote-control/
 public interface TransportChannel {
     void send(ChannelType ch, byte[] payload);  // CONTROL/VIDEO/AUDIO/FILE/CLIPBOARD
     void addListener(TransportListener l);
-    ChannelInfo info();                         // 路径类型、RTT、丢包率
+    ChannelInfo info();                         // 路径元数据；部分 transport 的 RTT/丢包当前为 0
     void close();
 }
 ```
@@ -224,23 +226,25 @@ public interface TransportChannel {
 
 ```
 P2P（QUIC/UDP）
-    │ 失败/劣化
+    │ 首次打洞失败，或持续丢包/PONG 静默/通道关闭
     ▼
 Relay-UDP（UDP 中继）
-    │ 失败/劣化
+    │ 当前节点失败且没有其他可用 UDP 节点
     ▼
 Relay-TCP/TLS（中继）
-    │ 失败
+    │ 当前节点失败且没有其他可用 TCP 节点
     ▼
-Relay-WebSocket(443)（伪装 HTTP 流量兜底）
-    │ 失败
+Relay-WebSocket/WSS（可由反向代理暴露 443）
+    │ 无健康候选或建立失败
     ▼
-会话结束 (Ended)
+首次 fallback：失败并结束；运行期迁移：ABORT 并保留旧权威路由
 ```
 
-- **硬门限**：传输层 close / 连续端到端保活无响应 → 提交 `RelaySwitchRequest`；
-- **软门限**：丢包率 / RTT / 卡顿率持续超阈值 → 降级（阈值由 EWMA 基线 + k·σ 动态计算）；
-- **故障换路**：客户端对同一 assignment 最多重试 3 次（指数退避 + full jitter），失败后上报；节点和下一传输类型只由服务端选择。
+- **本地触发**：传输层 close/reset、PONG 静默超过 `EWMA gap + k·σ` 的截断门限，或滑动窗口丢包率持续超阈值时，客户端上报 `RelayFailureReport`；
+- **当前边界**：RTT 会被测量并暴露为指标，但高 RTT 和视频卡顿率尚未接入降级判定；QoS 降级报告当前也未回填真实 RTT/丢包，只记录失败事件；
+- **画像用途**：Redis 中的容量、资源压力、失败率、RTT 和丢包画像只用于服务端选择下一 Relay，不被客户端读取，也不单独触发在途会话迁移；
+- **故障换路**：客户端对同一 assignment 最多重试 3 次（指数退避 + full jitter），失败后上报；节点和下一传输类型只由服务端选择；
+- **不支持热回切 P2P**：进入 Relay 后，当前会话不会自动重新打洞并切回 P2P。Relay 状态收到的旧 candidate 被忽略；重新连接/新会话才重新走 P2P 优先流程。
 
 ### 6.5 安全
 
@@ -288,21 +292,18 @@ mvn -pl server-signaling -am spring-boot:run
 
 # prod：MySQL + Redis（需先注入环境变量，见 §8）
 mvn -pl server-signaling -am spring-boot:run -Dspring-boot.run.profiles=prod
+
+# 或在完成 package 后运行 Spring Boot 可执行 JAR
+java -jar server-signaling/target/server-signaling-1.0.0-SNAPSHOT.jar
 ```
 
 ### 7.4 启动中继服务器
 
-中继为 `plain main`（非 Spring），配置经环境变量读取，dev 默认值可直接启动：
+中继为 `plain main`（非 Spring），`package` 会生成包含依赖的 `*-all.jar`，配置经环境变量读取，dev 默认值可直接启动：
 
 ```bash
 mvn -pl server-relay -am package -DskipTests
-
-# Windows 示例（classpath 分隔符为分号）
-mvn -pl server-relay -am dependency:build-classpath -Dmdep.outputFile=cp.txt
-java -cp "server-relay/target/classes;common/target/classes;$(cat cp.txt)" com.rc.relay.RelayApplication
-
-# Linux / macOS（分隔符为冒号）
-java -cp "server-relay/target/classes:common/target/classes:$(cat cp.txt)" com.rc.relay.RelayApplication
+java -jar server-relay/target/server-relay-1.0.0-SNAPSHOT-all.jar
 ```
 
 > 也可在 IDE 中直接运行 `RelayApplication` 的 `main`。
@@ -310,14 +311,16 @@ java -cp "server-relay/target/classes:common/target/classes:$(cat cp.txt)" com.r
 ### 7.5 启动客户端（两个实例）
 
 ```bash
-mvn -pl client -am package -DskipTests
-mvn -pl client -am dependency:build-classpath -Dmdep.outputFile=cp.txt
+mvn -pl client -am install -DskipTests
+mvn -pl client dependency:build-classpath -Dmdep.outputFile=target/runtime-cp.txt
 
-# Windows
-java -cp "client/target/classes;common/target/classes;$(cat cp.txt)" com.rc.client.app.ClientLauncher
+# Windows PowerShell
+$clientCp = (Get-Content client/target/runtime-cp.txt -Raw).Trim()
+java -cp "client/target/classes;common/target/classes;$clientCp" com.rc.client.app.ClientLauncher
 
-# Linux / macOS
-java -cp "client/target/classes:common/target/classes:$(cat cp.txt)" com.rc.client.app.ClientLauncher
+# Linux / macOS shell
+CLIENT_CP="$(cat client/target/runtime-cp.txt)"
+java -cp "client/target/classes:common/target/classes:$CLIENT_CP" com.rc.client.app.ClientLauncher
 ```
 
 > 启动入口为 `ClientLauncher`（独立于 JavaFX `Application` 子类，规避模块启动检查）。
@@ -446,7 +449,15 @@ OIDC 是可选能力；启用时同时激活 `oidc` profile（`prod,oidc`）并�
 - ✅ Nginx 双信令负载均衡与双 Relay 的 Docker Compose 集群编排
 - ✅ 桌面端 JavaFX UI + 键鼠远控链路
 
-> 本仓库测试命令为 `mvn test`。单元/并发测试覆盖票据、V2 JOIN、角色席位、连接 fencing、路由 CAS、健康评分、稳定通道和 E2EE；外部 Redis/MySQL/Nacos 与节点 kill 验收应使用 `deploy/docker-compose.cluster.yml`。当前执行环境没有 Docker，因此本次只能验证 compose 文件和 Java 构建，不能伪称容器/Chaos 已实跑。
+当前实现边界：
+
+- Relay assignment、Relay→Relay 换节点以及 Relay-UDP→TCP→WS 的服务端权威迁移已经接入运行主链；
+- Relay→P2P 的同会话热回切未实现，旧的客户端单边回切已删除，避免双方各自推进 `routeEpoch`；
+- `SessionActor/SessionReducer` 与 `RelayClusterInvoker` 已有实现和单测，但当前生产运行主链仍由 `ClientConnectionManager` 直接编排；
+- Nacos/Redis 画像不会主动扫描并迁移存量会话，当前迁移由客户端实时 QoS/断链报告或 assignment 建连失败触发；
+- 硬故障下旧链路可能已经不可用，状态机保证不脑裂和可恢复，不承诺业务零丢包。
+
+> 最近一次全量 `mvn clean test` 共运行 19 个测试，全部通过。覆盖票据、V2 JOIN、角色席位、连接 fencing、路由 CAS、健康评分、稳定通道和 E2EE；外部 Redis/MySQL/Nacos 与节点 kill 验收应使用 `deploy/docker-compose.cluster.yml`。当前执行环境没有 Docker，因此只验证了 compose 文件、Java 构建以及 Signaling/Relay 进程启动，没有把容器/Chaos 写成已通过。
 
 ---
 
@@ -456,7 +467,6 @@ OIDC 是可选能力；启用时同时激活 `oidc` profile（`prod,oidc`）并�
 |------|------|
 | [`远程控制软件开发文档.md`](远程控制软件开发文档.md) | 模块划分、协议、数据模型、流程、里程碑（实现以此为准） |
 | [`远程控制软件底层链路设计-内网穿透与P2P中继架构.md`](远程控制软件底层链路设计-内网穿透与P2P中继架构.md) | NAT/STUN/ICE/打洞/中继/QoS 底层原理 |
-| [`JavaDesk分布式化重构方案V2-超级完整版.md`](JavaDesk分布式化重构方案V2-超级完整版.md) | V2 权威目标、全局不变式、协议与验收标准 |
 | [`项目架构流程与底层原理.md`](项目架构流程与底层原理.md) | 当前项目架构、端到端流程、状态机与底层原理 |
 | [`CLAUDE.md`](CLAUDE.md) | 开发约定、关键设计决策、当前进度 |
 
@@ -464,4 +474,4 @@ OIDC 是可选能力；启用时同时激活 `oidc` profile（`prod,oidc`）并�
 
 ## License
 
-[Apache-2.0](LICENSE)（如未单独提供 License 文件，默认保留所有权利）。
+当前仓库尚未提供 `LICENSE` 文件，因此不能按 Apache-2.0 或其他开源许可证推定授权；在许可证文件正式加入前，默认保留所有权利。
