@@ -14,13 +14,15 @@ import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCountUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import tech.kwik.core.QuicConnection;
-import tech.kwik.core.QuicStream;
+import net.luminis.quic.QuicConnection;
+import net.luminis.quic.QuicStream;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -38,11 +40,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li><b>实时通道</b>（VIDEO / AUDIO）→ QUIC datagram（部分可靠，优先实时性，允许少量丢帧）。</li>
  * </ul>
  *
- * <p><b>kwik API 约定</b>：本类依赖 kwik 0.9.x 的 {@link QuicConnection#openStream()}、
+ * <p><b>kwik API 约定</b>：本类依赖 kwik 0.9.x 的 {@link QuicConnection#createStream(boolean)}、
  * {@link QuicStream#getInputStream()}/{@link QuicStream#getOutputStream()}，以及 datagram
- * 收发（见 {@link #sendDatagram} / {@link #receiveDatagram}）。这些方法签名在未装
- * Maven/JDK17 的环境下无法编译核对，接入时需对照 kwik 实际 javadoc 校正（datagram
- * 可能经 {@code QuicDatagramSocket} 而非连接直连方法暴露）。会话密钥（AES-256-GCM）
+ * 收发（见 {@link #sendDatagram} / {@link #receiveDatagram}）。Datagram 入站通过
+ * {@link QuicConnection#setDatagramHandler(java.util.function.Consumer)} 回调进入有界队列。
+ * 会话密钥（AES-256-GCM）
  * 暂存于此，与 {@link UdpTransportChannel} 一致，待 E2EE 数据面统一启用。</p>
  */
 public final class QuicTransportChannel implements TransportChannel {
@@ -60,6 +62,7 @@ public final class QuicTransportChannel implements TransportChannel {
     private final ScheduledExecutorService keepalive;
     private final Thread streamReader;
     private final Thread datagramReader;
+    private final BlockingQueue<byte[]> datagrams = new LinkedBlockingQueue<>(1024);
     private volatile boolean closed;
 
     /**
@@ -69,7 +72,12 @@ public final class QuicTransportChannel implements TransportChannel {
     public QuicTransportChannel(QuicConnection connection, byte[] sessionKey) throws IOException {
         this.connection = connection;
         this.sessionKey = sessionKey;
-        this.reliableStream = connection.openStream();
+        this.reliableStream = connection.createStream(true);
+        connection.setDatagramHandler(data -> {
+            if (!datagrams.offer(data)) {
+                log.debug("dropping quic datagram because receive queue is full");
+            }
+        });
         this.keepalive = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "rc-quic-keepalive");
             t.setDaemon(true);
@@ -135,7 +143,7 @@ public final class QuicTransportChannel implements TransportChannel {
         closed = true;
         keepalive.shutdownNow();
         try {
-            reliableStream.close();
+            reliableStream.getOutputStream().close();
         } catch (Exception e) {
             log.debug("reliable stream close failed", e);
         }
@@ -249,18 +257,22 @@ public final class QuicTransportChannel implements TransportChannel {
         }, Thresholds.KEEPALIVE_HOME_MS, Thresholds.KEEPALIVE_HOME_MS, TimeUnit.MILLISECONDS);
     }
 
-    // ---------- kwik datagram 收发的集中封装（API 待对照 kwik javadoc 校正） ----------
+    // ---------- kwik datagram 收发的集中封装 ----------
 
     /**
-     * 经 QUIC datagram 帧发送一帧。kwik 若经 {@code QuicDatagramSocket}（而非连接直连方法）
-     * 暴露 datagram，此处为唯一需调整的发送点。
+     * 经 QUIC datagram 帧发送一帧。
      */
     private void sendDatagram(byte[] data) throws IOException {
         connection.sendDatagram(data);
     }
 
-    /** 阻塞读取一个 QUIC datagram 帧（无数据时返回 {@code null} 或阻塞，取决于 kwik 语义）。 */
+    /** 从回调队列读取一个 QUIC datagram 帧，超时返回 {@code null}。 */
     private byte[] receiveDatagram() throws IOException {
-        return connection.receiveDatagram();
+        try {
+            return datagrams.poll(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
     }
 }

@@ -14,12 +14,15 @@ import com.rc.client.transport.RelayTcpTransportChannel;
 import com.rc.client.transport.RelayTransportChannel;
 import com.rc.client.transport.RelayWsTransportChannel;
 import com.rc.client.transport.TransportChannel;
+import com.rc.client.transport.SwitchableTransportChannel;
+import com.rc.client.transport.SecureTransportChannel;
 import com.rc.client.transport.UdpTransportChannel;
 import com.rc.common.constant.ErrorCode;
 import com.rc.common.constant.SessionStatus;
 import com.rc.common.constant.Thresholds;
 import com.rc.common.crypto.CryptoService;
 import com.rc.common.crypto.RsaCipher;
+import com.rc.common.crypto.RelayTicketV2.PeerRole;
 import com.rc.common.metrics.QosMetricNames;
 import com.rc.common.metrics.QosMetrics;
 import com.rc.common.model.ChannelInfo;
@@ -34,7 +37,12 @@ import com.rc.common.protocol.PathSwitchNotify;
 import com.rc.common.protocol.PathType;
 import com.rc.common.protocol.RegisterReq;
 import com.rc.common.protocol.RelayAllocReq;
-import com.rc.common.protocol.RelayAllocResp;
+import com.rc.common.protocol.RelayAssignmentV2;
+import com.rc.common.protocol.RelayPeerRole;
+import com.rc.common.protocol.RelayReadyV2;
+import com.rc.common.protocol.RelayFailureReport;
+import com.rc.common.protocol.RouteAbortV2;
+import com.rc.common.protocol.RouteCommitV2;
 import com.rc.common.protocol.SessionEnd;
 import com.rc.common.protocol.Signal;
 import com.rc.common.util.IdGenerator;
@@ -54,15 +62,15 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 客户端连接编排 / 会话状态机。
  *
  * <p>显式跟踪 {@link SessionStatus}：Online → Connecting → Probing →
  * P2PConnected | RelayConnected → Degraded → Ended。P2P 优先，打洞失败降级中继；
- * 运行中经 {@link QosMonitor} 检测保活丢失 / 通道关闭后降级 Relay。
- * Relay 运行期经 {@link #scheduleSwitchback} 静默重打洞 + 健康验证，成功后
- * make-before-break 回切 P2P（见 {@code P2PSwitchbackProbe}）。</p>
+ * 运行中经 {@link QosMonitor} 检测保活丢失 / 通道关闭后上报信令服务器，
+ * 所有运行期路径迁移均由服务端以 PREPARE/READY/COMMIT 协调。</p>
  */
 public final class ClientConnectionManager {
 
@@ -91,6 +99,7 @@ public final class ClientConnectionManager {
     }
 
     private enum Role { CONTROLLER, AGENT }
+    private record PreparedClientRoute(RelayAssignmentV2 assignment, TransportChannel channel) { }
 
     private static final class SessionContext {
         final long sessionId;
@@ -98,14 +107,19 @@ public final class ClientConnectionManager {
         final String remoteDeviceCode;
         final byte[] sessionKey;
         final java.util.concurrent.CompletableFuture<Void> inviteAccepted = new java.util.concurrent.CompletableFuture<>();
-        volatile java.util.concurrent.CompletableFuture<RelayAllocResp> relayAllocated = new java.util.concurrent.CompletableFuture<>();
+        volatile java.util.concurrent.CompletableFuture<TransportChannel> relayCommitted = new java.util.concurrent.CompletableFuture<>();
+        final Map<String, PreparedClientRoute> preparedChannels = new ConcurrentHashMap<>();
+        final AtomicBoolean migrationInFlight = new AtomicBoolean();
         final List<IceCandidate> remoteCandidates = new CopyOnWriteArrayList<>();
         volatile SessionStatus status = SessionStatus.IDLE;
         volatile PathType dataPath = PathType.PATH_UNKNOWN;
         volatile IceAgent iceAgent;
         volatile TransportChannel channel;
+        volatile SwitchableTransportChannel stableChannel;
+        volatile long routeEpoch;
+        volatile String assignmentId = "";
+        volatile String relayNodeId = "";
         volatile QosMonitor qosMonitor;
-        volatile P2PSwitchbackProbe switchbackProbe;
 
         SessionContext(long sessionId, Role role, String remoteDeviceCode, byte[] sessionKey) {
             this.sessionId = sessionId;
@@ -119,14 +133,13 @@ public final class ClientConnectionManager {
                 qosMonitor.close();
                 qosMonitor = null;
             }
-            P2PSwitchbackProbe probe = switchbackProbe;
-            if (probe != null) {
-                probe.close();
-                switchbackProbe = null;
-            }
-            if (channel != null) {
+            if (stableChannel != null) {
+                stableChannel.close();
+            } else if (channel != null) {
                 channel.close();
             }
+            preparedChannels.values().forEach(route -> route.channel().close());
+            preparedChannels.clear();
             if (iceAgent != null) {
                 iceAgent.close();
             }
@@ -162,6 +175,8 @@ public final class ClientConnectionManager {
 
     private SignalingClient signaling;
     private volatile long deviceId;
+    private volatile long connectionEpoch;
+    private final String clientInstanceId = java.util.UUID.randomUUID().toString();
     private final Map<Long, PendingInvite> pendingInvites = new ConcurrentHashMap<>();
     private volatile SessionContext activeSession;
 
@@ -364,12 +379,13 @@ public final class ClientConnectionManager {
                                     fallbackToRelay(ctx);
                                     return;
                                 }
-                                ctx.channel = channel;
+                                activateInitialChannel(ctx, channel, PathType.P2P);
                                 trackPath(ctx, PathType.P2P);
                                 transition(ctx, SessionStatus.P2P_CONNECTED);
-                                attachQosMonitor(ctx, channel);
+                                attachQosMonitor(ctx, ctx.stableChannel);
                                 log.info("P2P established, session={} peer={}", ctx.sessionId, result.peer());
-                                sessionListener.onConnected(ctx.remoteDeviceCode, channel, ctx.role == Role.CONTROLLER);
+                                sessionListener.onConnected(ctx.remoteDeviceCode, ctx.stableChannel,
+                                        ctx.role == Role.CONTROLLER);
                             }
                         });
             }, Thresholds.CANDIDATE_GATHER_WINDOW_MS, TimeUnit.MILLISECONDS);
@@ -392,7 +408,7 @@ public final class ClientConnectionManager {
                     ? QuicTransportEndpoint.selfSigned(identity.keyPair()) : null;
             QuicTransportEndpoint.Role role = ctx.role == Role.CONTROLLER
                     ? QuicTransportEndpoint.Role.CONTROLLER : QuicTransportEndpoint.Role.AGENT;
-            tech.kwik.core.QuicConnection conn = QuicTransportEndpoint.establish(
+            net.luminis.quic.QuicConnection conn = QuicTransportEndpoint.establish(
                     role, result.socket(), result.peer(), tls);
             return new QuicTransportChannel(conn, result.sessionKey());
         } catch (Exception e) {
@@ -412,13 +428,9 @@ public final class ClientConnectionManager {
         if (relay == null) {
             return; // establishRelay 内部已 fail
         }
-        ctx.channel = relay;
-        sendPathSwitch(ctx, ctx.dataPath, PathType.RELAY_UDP, "punch failed, degrade to relay");
-        trackPath(ctx, PathType.RELAY_UDP);
         transition(ctx, SessionStatus.RELAY_CONNECTED);
         attachQosMonitor(ctx, relay);
-        sessionListener.onConnected(ctx.remoteDeviceCode, relay, ctx.role == Role.CONTROLLER);
-        scheduleSwitchback(ctx);
+        sessionListener.onConnected(ctx.remoteDeviceCode, ctx.stableChannel, ctx.role == Role.CONTROLLER);
     }
 
     /**
@@ -427,7 +439,8 @@ public final class ClientConnectionManager {
      * future，避免复用上一协议已完成的响应。
      */
     private TransportChannel establishRelay(SessionContext ctx, PathType pathType) {
-        ctx.relayAllocated = new java.util.concurrent.CompletableFuture<>();
+        ctx.relayCommitted = new java.util.concurrent.CompletableFuture<>();
+        ctx.migrationInFlight.set(true);
         signaling.send(Signal.newBuilder()
                 .setSessionId(ctx.sessionId)
                 .setTimestamp(System.currentTimeMillis())
@@ -438,109 +451,70 @@ public final class ClientConnectionManager {
                         .build())
                 .build());
 
-        TransportChannel channel = null;
         try {
-            RelayAllocResp resp = ctx.relayAllocated.get(Thresholds.CONNECT_BUDGET_MS, TimeUnit.MILLISECONDS);
-            if (!resp.getOk()) {
-                fail(ctx, ErrorCode.of(resp.getErrorCode()), resp.getErrorMessage());
-                return null;
-            }
-            Endpoint relay = new Endpoint(resp.getRelayHost(), resp.getRelayPort());
-            channel = createRelayChannel(pathType, relay, ctx, resp.getToken(), resp.getTls());
-            QosMetrics.increment(QosMetricNames.RELAY_ALLOC_TOTAL, "path", pathType.name());
-            log.info("relay established, session={} path={} relay={}:{}",
-                    ctx.sessionId, pathType, resp.getRelayHost(), resp.getRelayPort());
-            return channel;
+            return ctx.relayCommitted.get(Thresholds.CONNECT_BUDGET_MS + 15_000, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
-            if (channel != null) {
-                channel.close();
-            }
+            ctx.migrationInFlight.set(false);
             fail(ctx, ErrorCode.RELAY_ALLOC_FAIL, "relay alloc timeout");
             return null;
         } catch (Exception e) {
-            if (channel != null) {
-                channel.close();
-            }
+            ctx.migrationInFlight.set(false);
             fail(ctx, ErrorCode.RELAY_ALLOC_FAIL, "relay fallback failed: " + e.getMessage());
             return null;
         }
     }
 
     /** 按协议创建中继通道并完成 JOIN。 */
-    private TransportChannel createRelayChannel(PathType pathType, Endpoint relay, SessionContext ctx,
-                                                String token, boolean tls) throws Exception {
+    private TransportChannel createRelayChannel(RelayAssignmentV2 assignment, SessionContext ctx,
+                                                String nonce) throws Exception {
+        PathType pathType = assignment.getEndpoint().getPathType();
+        Endpoint relay = new Endpoint(assignment.getEndpoint().getHost(), assignment.getEndpoint().getPort());
+        PeerRole role = assignment.getRole() == RelayPeerRole.RELAY_ROLE_CONTROLLER
+                ? PeerRole.CONTROLLER : PeerRole.AGENT;
+        TransportChannel raw;
         switch (pathType) {
             case RELAY_TCP: {
                 RelayTcpTransportChannel c = new RelayTcpTransportChannel(
-                        relay, ctx.sessionId, token, ctx.sessionKey, tls, signalingConfig.isTrustAll());
+                        relay, ctx.sessionId, assignment.getRouteEpoch(), role,
+                        assignment.getRelayTicket(), nonce, ctx.sessionKey,
+                        assignment.getEndpoint().getTls(), signalingConfig.isTrustAll());
                 c.start();
                 c.awaitJoined(Thresholds.CONNECT_BUDGET_MS);
-                return c;
+                raw = c; break;
             }
             case RELAY_WS: {
                 RelayWsTransportChannel c = new RelayWsTransportChannel(
-                        relay, ctx.sessionId, token, ctx.sessionKey, tls, signalingConfig.isTrustAll());
+                        relay, ctx.sessionId, assignment.getRouteEpoch(), role,
+                        assignment.getRelayTicket(), nonce, ctx.sessionKey,
+                        assignment.getEndpoint().getTls(), signalingConfig.isTrustAll());
                 c.start();
                 c.awaitJoined(Thresholds.CONNECT_BUDGET_MS);
-                return c;
+                raw = c; break;
             }
             default: {
-                RelayTransportChannel c = new RelayTransportChannel(relay, ctx.sessionId, token, ctx.sessionKey);
+                RelayTransportChannel c = new RelayTransportChannel(relay, ctx.sessionId,
+                        assignment.getRouteEpoch(), role, assignment.getRelayTicket(), nonce, ctx.sessionKey);
                 c.start();
                 c.awaitJoined(Thresholds.CONNECT_BUDGET_MS);
-                return c;
+                raw = c; break;
             }
         }
+        SecureTransportChannel.LocalRole localRole = ctx.role == Role.CONTROLLER
+                ? SecureTransportChannel.LocalRole.CONTROLLER : SecureTransportChannel.LocalRole.AGENT;
+        return new SecureTransportChannel(raw, ctx.sessionKey, ctx.sessionId,
+                assignment.getRouteEpoch(), pathType, localRole);
     }
 
-    /** 运行中降级：沿降级阶梯 P2P → Relay-UDP → Relay-TCP → Relay-WS 逐级下探；Relay-WS 再劣化即结束。 */
+    /** 运行中质量劣化：只上报观测，具体节点与协议由信令服务器统一选择。 */
     private void degrade(SessionContext ctx) {
         if (ctx.status != SessionStatus.P2P_CONNECTED && ctx.status != SessionStatus.RELAY_CONNECTED) {
             return;
         }
-        if (ctx.switchbackProbe != null && ctx.switchbackProbe.isActive()) {
-            return; // 回切探测进行中：relay 劣化属预期（对端可能已切走），交由探针裁决
-        }
-        PathType next = nextDegradePath(ctx.dataPath);
-        if (next == null) {
-            fail(ctx, ErrorCode.RELAY_ALLOC_FAIL, "all transport paths exhausted");
-            return;
-        }
+        if (!ctx.migrationInFlight.compareAndSet(false, true)) return;
         QosMetrics.increment(QosMetricNames.DEGRADE_EVENTS_TOTAL,
-                "from", ctx.dataPath.name(), "to", next.name());
+                "from", ctx.dataPath.name(), "to", "SERVER_SELECTED");
         transition(ctx, SessionStatus.DEGRADED);
-        if (ctx.qosMonitor != null) {
-            ctx.qosMonitor.close();
-            ctx.qosMonitor = null;
-        }
-        TransportChannel relay = establishRelay(ctx, next);
-        if (relay == null) {
-            return;
-        }
-        TransportChannel old = ctx.channel;
-        ctx.channel = relay;
-        sendPathSwitch(ctx, ctx.dataPath, next, "qos degrade");
-        trackPath(ctx, next);
-        if (old != null) {
-            old.close();
-        }
-        if (ctx.iceAgent != null) {
-            ctx.iceAgent.close();
-            ctx.iceAgent = null;
-        }
-        transition(ctx, SessionStatus.RELAY_CONNECTED);
-        attachQosMonitor(ctx, relay);
-        sessionListener.onPathChanged(next, relay.info());
-        scheduleSwitchback(ctx);
-    }
-
-    private PathType nextDegradePath(PathType current) {
-        return switch (current) {
-            case P2P -> PathType.RELAY_UDP;
-            case RELAY_UDP -> PathType.RELAY_TCP;
-            case RELAY_TCP -> PathType.RELAY_WS;
-            default -> null;
-        };
+        reportRelayFailure(ctx, "QOS_DEGRADED", 1, 0, 0f);
     }
 
     /** 数据面建立后挂载 QoS 监测器，保活丢失 / 通道关闭时降级。 */
@@ -559,199 +533,6 @@ public final class ClientConnectionManager {
                 worker.execute(() -> degrade(ctx));
             }
         });
-    }
-
-    // ---------- 回切（Relay → P2P make-before-break） ----------
-
-    /** 进入 relay 后延时发起回切探测（防抖期 {@link Thresholds#RELAY_DWELL_MS}）。 */
-    private void scheduleSwitchback(SessionContext ctx) {
-        worker.schedule(() -> startSwitchback(ctx), Thresholds.RELAY_DWELL_MS, TimeUnit.MILLISECONDS);
-    }
-
-    /** 启动回切探测（幂等）：非 relay 状态或已在探测则忽略，返回当前探测（可能为 null）。 */
-    private P2PSwitchbackProbe startSwitchback(SessionContext ctx) {
-        if (ctx.status != SessionStatus.RELAY_CONNECTED) {
-            return null;
-        }
-        synchronized (ctx) {
-            P2PSwitchbackProbe existing = ctx.switchbackProbe;
-            if (existing != null && existing.isActive()) {
-                return existing;
-            }
-            P2PSwitchbackProbe probe = new P2PSwitchbackProbe(ctx);
-            ctx.switchbackProbe = probe;
-            probe.start();
-            return probe;
-        }
-    }
-
-    /**
-     * 回切探测：静默重打洞 + 候选重交换 + 新 P2P 通道健康验证（连续
-     * {@link Thresholds#P2P_PROBE_SUCCESS_LIMIT} 次 + 质量提升 {@link Thresholds#P2P_IMPROVEMENT_RATIO}），
-     * 通过后 make-before-break 提交（先建 P2P、再拆 relay）。
-     */
-    private final class P2PSwitchbackProbe {
-        private final SessionContext ctx;
-        private final List<IceCandidate> remoteCandidates = new CopyOnWriteArrayList<>();
-        private final java.util.concurrent.atomic.AtomicBoolean done =
-                new java.util.concurrent.atomic.AtomicBoolean(false);
-
-        private IceAgent iceAgent;
-        private volatile TransportChannel candidateChannel;
-        private volatile QosMonitor verifyMonitor;
-
-        P2PSwitchbackProbe(SessionContext ctx) {
-            this.ctx = ctx;
-        }
-
-        void start() {
-            worker.execute(() -> {
-                if (done.get() || ctx.status != SessionStatus.RELAY_CONNECTED) {
-                    return;
-                }
-                iceAgent = new IceAgent(stunServers);
-                List<IceCandidate> local = iceAgent.gatherCandidates(stunTimeoutMs);
-                for (IceCandidate c : local) {
-                    signaling.send(candidateSignal(ctx.sessionId, c));
-                }
-                worker.schedule(this::punch, Thresholds.CANDIDATE_GATHER_WINDOW_MS, TimeUnit.MILLISECONDS);
-            });
-        }
-
-        void onRemoteCandidate(IceCandidate candidate) {
-            if (!done.get()) {
-                remoteCandidates.add(candidate);
-            }
-        }
-
-        boolean isActive() {
-            return !done.get();
-        }
-
-        private void punch() {
-            if (done.get() || ctx.status != SessionStatus.RELAY_CONNECTED) {
-                abort("session no longer on relay");
-                return;
-            }
-            if (remoteCandidates.isEmpty()) {
-                abort("no remote candidate for switchback");
-                return;
-            }
-            QosMetrics.increment(QosMetricNames.PUNCH_ATTEMPTS_TOTAL);
-            iceAgent.connect(remoteCandidates, ctx.sessionKey, Thresholds.CONNECT_BUDGET_MS)
-                    .whenComplete((result, t) -> {
-                        if (done.get()) {
-                            return;
-                        }
-                        if (t != null) {
-                            abort("switchback punch failed: " + t.getMessage());
-                            return;
-                        }
-                        TransportChannel channel = openP2PChannel(ctx, result);
-                        if (channel == null) {
-                            abort("switchback quic establish failed");
-                            return;
-                        }
-                        candidateChannel = channel;
-                        verify(channel);
-                    });
-        }
-
-        private void verify(TransportChannel channel) {
-            verifyMonitor = new QosMonitor(ctx.sessionId, channel, new QosListener() {
-                @Override
-                public void onKeepaliveLost() {
-                    worker.execute(() -> abort("switchback verify keepalive lost"));
-                }
-
-                @Override
-                public void onTransportClosed() {
-                    worker.execute(() -> abort("switchback verify transport closed"));
-                }
-
-                @Override
-                public void onProbeHealthy(int consecutive) {
-                    if (consecutive < Thresholds.P2P_PROBE_SUCCESS_LIMIT) {
-                        return;
-                    }
-                    worker.execute(() -> {
-                        if (qualityImproved()) {
-                            commit(channel);
-                        }
-                    });
-                }
-            });
-        }
-
-        /** 新 P2P 路径 RTT 需较当前 relay 至少下降 {@code P2P_IMPROVEMENT_RATIO}%，否则仅凭健康不足以上切。 */
-        private boolean qualityImproved() {
-            long relayRtt = ctx.qosMonitor != null ? ctx.qosMonitor.currentRttMs() : 0L;
-            long p2pRtt = verifyMonitor != null ? verifyMonitor.currentRttMs() : 0L;
-            if (relayRtt <= 0 || p2pRtt <= 0) {
-                return true; // 基线未知，仅凭连续健康判定
-            }
-            double budget = relayRtt * (100 - Thresholds.P2P_IMPROVEMENT_RATIO) / 100.0;
-            return p2pRtt <= budget;
-        }
-
-        private void commit(TransportChannel channel) {
-            if (!done.compareAndSet(false, true)) {
-                return;
-            }
-            if (verifyMonitor != null) {
-                verifyMonitor.close();
-                verifyMonitor = null;
-            }
-            ctx.switchbackProbe = null;
-            TransportChannel old = ctx.channel;
-            ctx.channel = channel;
-            ctx.iceAgent = iceAgent;   // 探针 socket 生命周期转正，随会话统一回收
-            sendPathSwitch(ctx, ctx.dataPath, PathType.P2P, "make-before-break switchback");
-            trackPath(ctx, PathType.P2P);
-            transition(ctx, SessionStatus.P2P_CONNECTED);
-            attachQosMonitor(ctx, channel);
-            QosMetrics.increment(QosMetricNames.SWITCHBACK_TOTAL);
-            log.info("switchback committed, session={}", ctx.sessionId);
-            sessionListener.onPathChanged(PathType.P2P, channel.info());
-            sessionListener.onChannelSwitched(channel, ctx.role == Role.CONTROLLER);
-            if (old != null) {
-                old.close();
-            }
-        }
-
-        private void abort(String reason) {
-            if (!done.compareAndSet(false, true)) {
-                return;
-            }
-            cleanup();
-            QosMetrics.increment(QosMetricNames.SWITCHBACK_ABORT_TOTAL);
-            log.info("switchback aborted, session={} reason={}", ctx.sessionId, reason);
-            scheduleSwitchback(ctx);
-        }
-
-        /** 会话结束时的静默清理（不重试）。 */
-        void close() {
-            if (!done.compareAndSet(false, true)) {
-                return;
-            }
-            cleanup();
-        }
-
-        private void cleanup() {
-            ctx.switchbackProbe = null;
-            if (verifyMonitor != null) {
-                verifyMonitor.close();
-                verifyMonitor = null;
-            }
-            if (candidateChannel != null) {
-                candidateChannel.close();
-                candidateChannel = null;
-            }
-            if (iceAgent != null) {
-                iceAgent.close();
-                iceAgent = null;
-            }
-        }
     }
 
     private Signal candidateSignal(long sessionId, IceCandidate candidate) {
@@ -773,21 +554,6 @@ public final class ClientConnectionManager {
                 .build();
     }
 
-    /** 上报数据面路径迁移（降级/回切），供信令侧审计与中继质量评分。 */
-    private void sendPathSwitch(SessionContext ctx, PathType from, PathType to, String reason) {
-        PathSwitchNotify notify = PathSwitchNotify.newBuilder()
-                .setSessionId(ctx.sessionId)
-                .setFromPath(from == null ? PathType.PATH_UNKNOWN : from)
-                .setToPath(to)
-                .setReason(reason == null ? "" : reason)
-                .build();
-        signaling.send(Signal.newBuilder()
-                .setSessionId(ctx.sessionId)
-                .setTimestamp(System.currentTimeMillis())
-                .setPathSwitch(notify)
-                .build());
-    }
-
     // ---------- 信令回调 ----------
 
     private SignalingListener signalingListener() {
@@ -806,15 +572,23 @@ public final class ClientConnectionManager {
             public void onSignal(Signal signal) {
                 if (signal.hasRegisterResp()) {
                     deviceId = signal.getRegisterResp().getDeviceId();
+                    connectionEpoch = signal.getRegisterResp().getConnectionEpoch();
                     log.info("device registered, deviceId={} code={}", deviceId, identity.deviceCode());
+                    sessions.keySet().forEach(ClientConnectionManager.this::requestSnapshot);
                 } else if (signal.hasInviteReq()) {
                     worker.execute(() -> doHandleInvite(signal));
                 } else if (signal.hasInviteResp()) {
                     handleInviteResp(signal.getInviteResp());
                 } else if (signal.hasCandidateMsg()) {
                     handleCandidate(signal.getCandidateMsg());
-                } else if (signal.hasRelayAllocResp()) {
-                    handleRelayAllocResp(signal.getRelayAllocResp());
+                } else if (signal.hasRelayAssignmentV2()) {
+                    worker.execute(() -> handleRelayAssignment(signal.getRelayAssignmentV2()));
+                } else if (signal.hasRouteCommitV2()) {
+                    worker.execute(() -> handleRouteCommit(signal.getRouteCommitV2()));
+                } else if (signal.hasRouteAbortV2()) {
+                    worker.execute(() -> handleRouteAbort(signal.getRouteAbortV2()));
+                } else if (signal.hasSessionSnapshotRespV2()) {
+                    worker.execute(() -> handleSessionSnapshot(signal.getSessionSnapshotRespV2()));
                 } else if (signal.hasSessionEnd()) {
                     handleSessionEnd(signal.getSessionEnd());
                 } else if (signal.hasPathSwitch()) {
@@ -836,6 +610,11 @@ public final class ClientConnectionManager {
                 .setNatType(NatType.NAT_UNKNOWN) // NAT 类型在连接期经 STUN 推断，注册期不额外探测
                 .setToken(accessToken)
                 .setPublicKey(identity.publicKeyBase64())
+                .setClientInstanceId(clientInstanceId)
+                .setMinProtocolVersion("2.0")
+                .setMaxProtocolVersion("2.0")
+                .addCapabilities("relay-migration-v2")
+                .addCapabilities("e2ee-outer-frame-v1")
                 .build();
         signaling.send(Signal.newBuilder()
                 .setTimestamp(System.currentTimeMillis())
@@ -871,23 +650,151 @@ public final class ClientConnectionManager {
                 msg.getSdpMid(),
                 msg.getSdpMlineIndex());
         if (ctx.status == SessionStatus.RELAY_CONNECTED) {
-            // relay 运行中收到候选 = 对端发起回切探测，本端同步启动并投递候选
-            P2PSwitchbackProbe probe = ctx.switchbackProbe;
-            if (probe == null || !probe.isActive()) {
-                probe = startSwitchback(ctx);
-            }
-            if (probe != null) {
-                probe.onRemoteCandidate(candidate);
-            }
+            // 运行期路由由服务端统一协调；Relay 状态下的旧候选不能触发单端自治回切。
+            log.debug("stale P2P candidate ignored while relay is active, session={}", ctx.sessionId);
             return;
         }
         ctx.remoteCandidates.add(candidate);
     }
 
-    private void handleRelayAllocResp(RelayAllocResp resp) {
-        SessionContext ctx = sessions.get(resp.getSessionId());
-        if (ctx != null) {
-            ctx.relayAllocated.complete(resp);
+    private void handleRelayAssignment(RelayAssignmentV2 assignment) {
+        SessionContext ctx = sessions.get(assignment.getSessionId());
+        if (ctx == null || ctx.status == SessionStatus.ENDED) return;
+        if (assignment.getDeadlineAt() <= System.currentTimeMillis()
+                || assignment.getBaseEpoch() != ctx.routeEpoch) {
+            requestSnapshot(ctx.sessionId);
+            return;
+        }
+        PreparedClientRoute duplicate = ctx.preparedChannels.get(assignment.getAssignmentId());
+        if (duplicate != null) {
+            sendRelayReady(assignment);
+            return;
+        }
+        String nonce = java.util.UUID.randomUUID().toString();
+        Throwable last = null;
+        for (int attempt = 1; attempt <= 3 && System.currentTimeMillis() < assignment.getDeadlineAt(); attempt++) {
+            TransportChannel channel = null;
+            try {
+                channel = createRelayChannel(assignment, ctx, nonce);
+                ctx.preparedChannels.put(assignment.getAssignmentId(), new PreparedClientRoute(assignment, channel));
+                QosMetrics.increment(QosMetricNames.RELAY_ALLOC_TOTAL,
+                        "path", assignment.getEndpoint().getPathType().name());
+                sendRelayReady(assignment);
+                return;
+            } catch (Throwable failure) {
+                last = failure;
+                if (channel != null) channel.close();
+                if (attempt < 3) {
+                    long cap = Math.min(2_000L, 200L << (attempt - 1));
+                    long delay = java.util.concurrent.ThreadLocalRandom.current().nextLong(cap + 1);
+                    try { Thread.sleep(delay); } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt(); break;
+                    }
+                }
+            }
+        }
+        ctx.migrationInFlight.set(false);
+        reportRelayFailure(ctx, assignment, "ASSIGNMENT_CONNECT_FAILED", 3, 0, 0f);
+        log.warn("assigned relay preparation failed: session={} assignment={} error={}",
+                ctx.sessionId, assignment.getAssignmentId(), last == null ? "unknown" : last.getMessage());
+    }
+
+    private void sendRelayReady(RelayAssignmentV2 assignment) {
+        String readyRequestId = assignment.getRequestId() + "-ready-" + assignment.getRole().name();
+        signaling.send(Signal.newBuilder().setSessionId(assignment.getSessionId())
+                .setTimestamp(System.currentTimeMillis()).setTraceId(readyRequestId)
+                .setRelayReadyV2(RelayReadyV2.newBuilder().setSessionId(assignment.getSessionId())
+                        .setRouteEpoch(assignment.getRouteEpoch()).setAssignmentId(assignment.getAssignmentId())
+                        .setRequestId(readyRequestId)).build());
+    }
+
+    private void handleRouteCommit(RouteCommitV2 commit) {
+        SessionContext ctx = sessions.get(commit.getSessionId());
+        if (ctx == null || commit.getRouteEpoch() <= ctx.routeEpoch) return;
+        PreparedClientRoute prepared = ctx.preparedChannels.remove(commit.getAssignmentId());
+        if (prepared == null || prepared.assignment().getRouteEpoch() != commit.getRouteEpoch()) {
+            requestSnapshot(ctx.sessionId);
+            return;
+        }
+        TransportChannel next = prepared.channel();
+        if (ctx.stableChannel == null) ctx.stableChannel = new SwitchableTransportChannel(commit.getRouteEpoch(), next);
+        else if (!ctx.stableChannel.commit(commit.getRouteEpoch(), next)) return;
+        ctx.channel = next;
+        ctx.routeEpoch = commit.getRouteEpoch();
+        ctx.assignmentId = commit.getAssignmentId();
+        ctx.relayNodeId = commit.getEndpoint().getRelayNodeId();
+        ctx.migrationInFlight.set(false);
+        ctx.preparedChannels.values().removeIf(route -> {
+            if (route.assignment().getRouteEpoch() <= commit.getRouteEpoch()) { route.channel().close(); return true; }
+            return false;
+        });
+        trackPath(ctx, commit.getEndpoint().getPathType());
+        transition(ctx, SessionStatus.RELAY_CONNECTED);
+        attachQosMonitor(ctx, ctx.stableChannel);
+        ctx.relayCommitted.complete(ctx.stableChannel);
+        sessionListener.onPathChanged(ctx.dataPath, ctx.stableChannel.info());
+    }
+
+    private void handleRouteAbort(RouteAbortV2 abort) {
+        SessionContext ctx = sessions.get(abort.getSessionId());
+        if (ctx == null) return;
+        PreparedClientRoute prepared = ctx.preparedChannels.remove(abort.getAssignmentId());
+        if (prepared != null) prepared.channel().close();
+        ctx.migrationInFlight.set(false);
+        if (ctx.stableChannel == null && abort.getAssignmentId().isBlank()) {
+            ctx.relayCommitted.completeExceptionally(new IllegalStateException(abort.getReason()));
+        }
+    }
+
+    private void reportRelayFailure(SessionContext ctx, String type, int attempts, int rtt, float loss) {
+        RelayFailureReport report = RelayFailureReport.newBuilder().setSessionId(ctx.sessionId)
+                .setRouteEpoch(ctx.routeEpoch).setAssignmentId(ctx.assignmentId)
+                .setRelayNodeId(ctx.relayNodeId).setPathType(ctx.dataPath)
+                .setFailureType(type).setAttemptCount(attempts).setObservedRttMs(rtt)
+                .setObservedLossRate(loss).setFirstFailureAt(System.currentTimeMillis())
+                .setLastFailureAt(System.currentTimeMillis()).setRegion(
+                        signalingConfig.getRegion() == null ? "" : signalingConfig.getRegion())
+                .setRequestId(java.util.UUID.randomUUID().toString()).build();
+        signaling.send(Signal.newBuilder().setSessionId(ctx.sessionId).setTimestamp(System.currentTimeMillis())
+                .setTraceId(report.getRequestId()).setRelayFailureReport(report).build());
+    }
+
+    private void reportRelayFailure(SessionContext ctx, RelayAssignmentV2 assignment, String type,
+                                    int attempts, int rtt, float loss) {
+        RelayFailureReport report = RelayFailureReport.newBuilder().setSessionId(ctx.sessionId)
+                .setRouteEpoch(assignment.getRouteEpoch()).setAssignmentId(assignment.getAssignmentId())
+                .setRelayNodeId(assignment.getEndpoint().getRelayNodeId())
+                .setPathType(assignment.getEndpoint().getPathType()).setFailureType(type)
+                .setAttemptCount(attempts).setObservedRttMs(rtt).setObservedLossRate(loss)
+                .setFirstFailureAt(System.currentTimeMillis()).setLastFailureAt(System.currentTimeMillis())
+                .setRegion(signalingConfig.getRegion() == null ? "" : signalingConfig.getRegion())
+                .setRequestId(assignment.getRequestId()).build();
+        signaling.send(Signal.newBuilder().setSessionId(ctx.sessionId).setTimestamp(System.currentTimeMillis())
+                .setTraceId(assignment.getRequestId()).setRelayFailureReport(report).build());
+    }
+
+    private void requestSnapshot(long sessionId) {
+        signaling.send(Signal.newBuilder().setSessionId(sessionId).setTimestamp(System.currentTimeMillis())
+                .setSessionSnapshotReqV2(com.rc.common.protocol.SessionSnapshotReqV2.newBuilder()
+                        .setSessionId(sessionId)).build());
+    }
+
+    private void handleSessionSnapshot(com.rc.common.protocol.SessionSnapshotRespV2 snapshot) {
+        SessionContext ctx = sessions.get(snapshot.getSessionId());
+        if (ctx == null) return;
+        if ("ENDED".equals(snapshot.getSessionState())) {
+            endSession(ctx, snapshot.getEndReason());
+            return;
+        }
+        if (snapshot.getCommittedRouteEpoch() > ctx.routeEpoch
+                && !snapshot.getCommittedAssignmentId().isBlank()) {
+            PreparedClientRoute prepared = ctx.preparedChannels.get(snapshot.getCommittedAssignmentId());
+            if (prepared != null) {
+                handleRouteCommit(RouteCommitV2.newBuilder().setSessionId(ctx.sessionId)
+                        .setRouteEpoch(snapshot.getCommittedRouteEpoch())
+                        .setAssignmentId(snapshot.getCommittedAssignmentId())
+                        .setEndpoint(snapshot.getCommittedEndpoint()).build());
+            }
         }
     }
 
@@ -963,6 +870,16 @@ public final class ClientConnectionManager {
         decrementPath(old);
         incrementPath(now);
         ctx.dataPath = now;
+    }
+
+    private void activateInitialChannel(SessionContext ctx, TransportChannel channel, PathType path) {
+        ctx.routeEpoch = 0;
+        SecureTransportChannel.LocalRole localRole = ctx.role == Role.CONTROLLER
+                ? SecureTransportChannel.LocalRole.CONTROLLER : SecureTransportChannel.LocalRole.AGENT;
+        TransportChannel secure = new SecureTransportChannel(channel, ctx.sessionKey,
+                ctx.sessionId, ctx.routeEpoch, path, localRole);
+        ctx.channel = secure;
+        ctx.stableChannel = new SwitchableTransportChannel(ctx.routeEpoch, secure);
     }
 
     private void incrementPath(PathType p) {

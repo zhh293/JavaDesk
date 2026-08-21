@@ -13,6 +13,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
+import java.lang.management.ManagementFactory;
 
 /**
  * 中继节点心跳上报：周期性向信令服务器内部接口 POST 节点身份 / 端口 / 负载，
@@ -30,6 +31,8 @@ public final class RelayHeartbeatReporter implements AutoCloseable {
     private final int capacity;
     private final HttpClient http;
     private final ScheduledExecutorService scheduler;
+    private double previousBytes;
+    private long previousSampleAt = System.currentTimeMillis();
 
     public RelayHeartbeatReporter(RelayConfig config, Supplier<Integer> activeSessions, int capacity) {
         this.config = config;
@@ -51,14 +54,21 @@ public final class RelayHeartbeatReporter implements AutoCloseable {
 
     private void report() {
         double load = Math.min(1.0, (double) activeSessions.get() / capacity);
-        String json = String.format(
+        double cpu = cpuRatio();
+        double memory = directMemoryRatio();
+        double bandwidth = bandwidthRatio();
+        String json = String.format(java.util.Locale.ROOT,
                 "{\"nodeId\":\"%s\",\"host\":\"%s\",\"region\":\"%s\",\"udpPort\":%d,\"tcpPort\":%d,"
-                        + "\"wsPort\":%d,\"tls\":%s,\"loadRatio\":%.4f}",
+                        + "\"wsPort\":%d,\"tls\":%s,\"loadRatio\":%.4f,\"activeSessions\":%d,"
+                        + "\"capacity\":%d,\"cpuRatio\":%.4f,\"bandwidthRatio\":%.4f,"
+                        + "\"directMemoryRatio\":%.4f}",
                 esc(config.nodeId()), esc(config.advertiseHost()), esc(config.region()),
-                config.udpPort(), config.tcpPort(), config.wsPort(), config.tls(), load);
+                config.udpPort(), config.tcpPort(), config.wsPort(), config.tls(), load,
+                activeSessions.get(), capacity, cpu, bandwidth, memory);
         try {
             HttpRequest request = HttpRequest.newBuilder(URI.create(config.signalingUrl()))
                     .header("Content-Type", "application/json")
+                    .header("X-RC-Internal-Token", config.internalServiceToken())
                     .timeout(Duration.ofSeconds(3))
                     .POST(HttpRequest.BodyPublishers.ofString(json))
                     .build();
@@ -86,5 +96,33 @@ public final class RelayHeartbeatReporter implements AutoCloseable {
             return "";
         }
         return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private static double cpuRatio() {
+        java.lang.management.OperatingSystemMXBean bean = ManagementFactory.getOperatingSystemMXBean();
+        if (bean instanceof com.sun.management.OperatingSystemMXBean extended) {
+            double value = extended.getCpuLoad();
+            return value < 0 ? 0 : Math.min(1, value);
+        }
+        return 0;
+    }
+
+    private static double directMemoryRatio() {
+        long used = io.netty.util.internal.PlatformDependent.usedDirectMemory();
+        long max = io.netty.util.internal.PlatformDependent.maxDirectMemory();
+        return used < 0 || max <= 0 ? 0 : Math.min(1, (double) used / max);
+    }
+
+    private double bandwidthRatio() {
+        double bytes = com.rc.common.metrics.QosMetrics.registry()
+                .find(com.rc.common.metrics.QosMetricNames.BYTES_TX_TOTAL).counters()
+                .stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+        long now = System.currentTimeMillis();
+        double seconds = Math.max(0.001, (now - previousSampleAt) / 1000.0);
+        double bytesPerSecond = Math.max(0, bytes - previousBytes) / seconds;
+        previousBytes = bytes;
+        previousSampleAt = now;
+        double capacityBytesPerSecond = Math.max(1, config.bandwidthCapacityMbps() * 1_000_000 / 8.0);
+        return Math.min(1, bytesPerSecond / capacityBytesPerSecond);
     }
 }

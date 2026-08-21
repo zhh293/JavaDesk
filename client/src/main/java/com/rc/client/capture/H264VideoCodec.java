@@ -5,8 +5,6 @@ import org.jcodec.codecs.h264.H264Encoder;
 import org.jcodec.common.model.ColorSpace;
 import org.jcodec.common.model.Picture;
 import org.jcodec.scale.AWTUtil;
-import org.jcodec.scale.RgbToYuv420;
-import org.jcodec.scale.Transform;
 
 import java.awt.image.BufferedImage;
 import java.nio.ByteBuffer;
@@ -14,8 +12,8 @@ import java.nio.ByteBuffer;
 /**
  * H.264 编码器（JCodec 纯 Java 软编），实现 {@link VideoCodec} 的 H.264 落地骨架。
  *
- * <p>流程：{@code BufferedImage(RGB)} → {@link AWTUtil#fromBufferedImage} → RGB {@link Picture}
- * → {@link RgbToYuv420} → YUV420 → {@link H264Encoder#encodeFrame} → NAL 字节流；解码反向。
+ * <p>流程：{@code BufferedImage(RGB)} → {@link AWTUtil#fromBufferedImage} → YUV420
+ * {@link Picture} → {@link H264Encoder#encodeFrame} → NAL 字节流；解码反向。
  * 输出为「关键帧 + 增量帧」的真实 GOP，配合 {@link VideoFraming} 的分片 / FEC / NACK 抗丢包管线。</p>
  *
  * <p><b>定位与校正</b>：JCodec 软编为硬编（NVENC / QuickSync / VAAPI，经 FFmpeg native）落地前的
@@ -34,7 +32,8 @@ public final class H264VideoCodec implements VideoCodec {
 
     private final H264Encoder encoder;
     private final H264Decoder decoder;
-    private final Transform rgbToYuv = new RgbToYuv420(0, 0);
+    private static final int MAX_DECODE_WIDTH = 3840;
+    private static final int MAX_DECODE_HEIGHT = 2160;
 
     public H264VideoCodec() {
         this.encoder = H264Encoder.createH264Encoder();
@@ -43,15 +42,13 @@ public final class H264VideoCodec implements VideoCodec {
 
     @Override
     public EncodedFrame encode(BufferedImage image, boolean forceKeyFrame) {
-        Picture rgb = AWTUtil.fromBufferedImage(image);
-        Picture yuv = Picture.create(rgb.getWidth(), rgb.getHeight(), ColorSpace.YUV420);
-        rgbToYuv.transform(rgb, yuv);
-        ByteBuffer out = ByteBuffer.allocate(4 << 20); // 4 MiB 初始容量，编码器可续写
-        out = encoder.encodeFrame(yuv, out);
-        byte[] data = new byte[out.remaining()];
-        out.get(data);
-        // 待校正：扫描 NAL 检测 IDR 以精确标记关键帧。
-        return new EncodedFrame(data, forceKeyFrame, System.currentTimeMillis());
+        Picture yuv = AWTUtil.fromBufferedImage(image, ColorSpace.YUV420);
+        ByteBuffer out = ByteBuffer.allocate(Math.max(encoder.estimateBufferSize(yuv), 1 << 20));
+        org.jcodec.common.VideoEncoder.EncodedFrame encoded = encoder.encodeFrame(yuv, out);
+        ByteBuffer bytes = encoded.getData().duplicate();
+        byte[] data = new byte[bytes.remaining()];
+        bytes.get(data);
+        return new EncodedFrame(data, encoded.isKeyFrame(), System.currentTimeMillis());
     }
 
     @Override
@@ -60,7 +57,10 @@ public final class H264VideoCodec implements VideoCodec {
             return null;
         }
         try {
-            Picture pic = decoder.decodeFrame(ByteBuffer.wrap(data), new int[0][]);
+            int luma = MAX_DECODE_WIDTH * MAX_DECODE_HEIGHT;
+            Picture pic = decoder.decodeFrame(ByteBuffer.wrap(data), new byte[][]{
+                    new byte[luma], new byte[luma / 4], new byte[luma / 4]
+            });
             if (pic == null) {
                 return null;
             }

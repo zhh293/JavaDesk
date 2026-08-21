@@ -63,7 +63,8 @@ public class SignalingServer implements SmartLifecycle {
                                 ch.pipeline().addLast("ssl", sslContext.newHandler(ch.alloc()));
                             }
                             // 读空闲 = 设备 TTL（超过即判心跳超时下线）
-                            ch.pipeline().addLast("idle", new IdleStateHandler(props.getDeviceTtlSeconds(), 0, 0));
+                            ch.pipeline().addLast("idle", new IdleStateHandler(
+                                    Math.toIntExact(props.getDeviceTtlSeconds()), 0, 0));
                             ch.pipeline().addLast("signalDecoder", new SignalFrameDecoder());
                             ch.pipeline().addLast("signalEncoder", new SignalFrameEncoder());
                             ch.pipeline().addLast("signalHandler", handler);
@@ -81,16 +82,23 @@ public class SignalingServer implements SmartLifecycle {
     private SslContext buildSslContext() {
         try {
             if (props.getCertFile() != null && !props.getCertFile().isBlank()) {
-                if (props.getCertPassword() != null && !props.getCertPassword().isBlank()) {
-                    return SslContextBuilder.forServer(new File(props.getCertFile()), props.getCertPassword()).build();
+                if (props.getKeyFile() == null || props.getKeyFile().isBlank()) {
+                    throw new IllegalStateException("rc.signaling.key-file is required with cert-file");
                 }
-                return SslContextBuilder.forServer(new File(props.getCertFile())).build();
+                return SslContextBuilder.forServer(
+                        new File(props.getCertFile()),
+                        new File(props.getKeyFile()),
+                        emptyToNull(props.getCertPassword())).build();
             }
             SelfSignedCertificate ssc = new SelfSignedCertificate();
             return SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey()).build();
         } catch (Exception e) {
             throw new IllegalStateException("failed to build SSL context", e);
         }
+    }
+
+    private static String emptyToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
     }
 
     @Override

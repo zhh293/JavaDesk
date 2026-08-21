@@ -81,7 +81,11 @@ public final class ClipboardService implements TransportListener {
                 fingerprint = "t:" + Integer.toHexString(text.hashCode());
                 payload = ClipboardCodec.text(text);
             } else if (contents.isDataFlavorSupported(DataFlavor.imageFlavor)) {
-                byte[] png = imageToPng(toBufferedImage(contents.getTransferData(DataFlavor.imageFlavor)));
+                Object imageValue = contents.getTransferData(DataFlavor.imageFlavor);
+                if (!(imageValue instanceof Image image)) {
+                    return;
+                }
+                byte[] png = imageToPng(toBufferedImage(image));
                 if (png == null) {
                     return;
                 }

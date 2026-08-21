@@ -17,8 +17,20 @@ public class SecurityProperties {
 
     private long refreshTokenTtlSeconds = 604800;
 
-    /** SSO/OIDC 登录成功后，携带 JWT 重定向回前端回调地址（如 {@code http://localhost:3000/sso/callback}）。 */
+    /** SSO/OIDC 登录成功后，携带一次性交接码重定向回前端回调地址。 */
     private String ssoRedirectUri = "http://localhost:3000/sso/callback";
+
+    /** Defense-in-depth credential for internal APIs; production also requires network mTLS. */
+    private String internalServiceToken = "rc-internal-dev-token-change-me";
+
+    /** Ed25519 PKCS#8/X.509 keys. Blank in dev generates an ephemeral pair exposed to Relay over internal API. */
+    private String relayTicketPrivateKey = "";
+    private String relayTicketPublicKey = "";
+    private String relayTicketKeyId = "relay-ticket-dev-1";
+    private String relayTicketIssuer = "javadesk-signaling";
+    /** Optional overlap key kept during rotation until all old 30-second tickets expire. */
+    private String relayTicketPreviousPublicKey = "";
+    private String relayTicketPreviousKeyId = "";
 
     public String getJwtSecret() {
         return jwtSecret;
@@ -51,4 +63,25 @@ public class SecurityProperties {
     public void setRefreshTokenTtlSeconds(long refreshTokenTtlSeconds) {
         this.refreshTokenTtlSeconds = refreshTokenTtlSeconds;
     }
+
+    public String getInternalServiceToken() {
+        return internalServiceToken;
+    }
+
+    public void setInternalServiceToken(String internalServiceToken) {
+        this.internalServiceToken = internalServiceToken;
+    }
+
+    public String getRelayTicketPrivateKey() { return relayTicketPrivateKey; }
+    public void setRelayTicketPrivateKey(String value) { relayTicketPrivateKey = value; }
+    public String getRelayTicketPublicKey() { return relayTicketPublicKey; }
+    public void setRelayTicketPublicKey(String value) { relayTicketPublicKey = value; }
+    public String getRelayTicketKeyId() { return relayTicketKeyId; }
+    public void setRelayTicketKeyId(String value) { relayTicketKeyId = value; }
+    public String getRelayTicketIssuer() { return relayTicketIssuer; }
+    public void setRelayTicketIssuer(String value) { relayTicketIssuer = value; }
+    public String getRelayTicketPreviousPublicKey() { return relayTicketPreviousPublicKey; }
+    public void setRelayTicketPreviousPublicKey(String value) { relayTicketPreviousPublicKey = value; }
+    public String getRelayTicketPreviousKeyId() { return relayTicketPreviousKeyId; }
+    public void setRelayTicketPreviousKeyId(String value) { relayTicketPreviousKeyId = value; }
 }

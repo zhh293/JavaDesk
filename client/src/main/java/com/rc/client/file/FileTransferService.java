@@ -61,22 +61,7 @@ public final class FileTransferService implements TransportListener {
     });
 
     /** 接收端上下文：Caffeine 过期自动关闭文件 + 删除半截文件。 */
-    private final Cache<Integer, ReceiveCtx> receiving = Caffeine.newBuilder()
-            .expireAfterAccess(Duration.ofMinutes(5))
-            .removalListener((Integer id, ReceiveCtx ctx, RemovalCause cause) -> {
-                closeQuietly(ctx.out());
-                if (cause != RemovalCause.EXPLICIT && cause != RemovalCause.REPLACED) {
-                    try {
-                        Files.deleteIfExists(ctx.path());
-                    } catch (IOException ignored) {
-                        // 忽略清理失败
-                    }
-                    if (listener != null) {
-                        listener.onError(id, "transfer timed out");
-                    }
-                }
-            })
-            .build();
+    private final Cache<Integer, ReceiveCtx> receiving;
 
     /** 发送端上下文（仅持文件路径供 NACK 重传，过期自动清理，无打开句柄）。 */
     private final Cache<Integer, SendCtx> sending = Caffeine.newBuilder()
@@ -87,6 +72,22 @@ public final class FileTransferService implements TransportListener {
         this.channel = channel;
         this.receiveDir = receiveDir;
         this.listener = listener;
+        this.receiving = Caffeine.newBuilder()
+                .expireAfterAccess(Duration.ofMinutes(5))
+                .removalListener((Integer id, ReceiveCtx ctx, RemovalCause cause) -> {
+                    closeQuietly(ctx.out());
+                    if (cause != RemovalCause.EXPLICIT && cause != RemovalCause.REPLACED) {
+                        try {
+                            Files.deleteIfExists(ctx.path());
+                        } catch (IOException ignored) {
+                            // 忽略清理失败
+                        }
+                        if (this.listener != null) {
+                            this.listener.onError(id, "transfer timed out");
+                        }
+                    }
+                })
+                .build();
     }
 
     /** 发送本地文件到对端默认接收目录（文件名作相对路径）。 */

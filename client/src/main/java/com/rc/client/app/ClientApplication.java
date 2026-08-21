@@ -133,12 +133,16 @@ public class ClientApplication extends Application implements RemoteControlClien
     }
 
     private RemoteControlClient buildClient(String host) {
-        String baseUrl = "http://" + host + ":" + REST_PORT;
+        boolean loopback = "localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host) || "::1".equals(host);
+        String restScheme = System.getProperty("rc.client.rest-scheme", loopback ? "http" : "https");
+        String baseUrl = restScheme + "://" + host + ":" + REST_PORT;
         SignalingClientConfig sc = new SignalingClientConfig();
         sc.setHost(host);
         sc.setPort(SIGNALING_PORT);
         sc.setTls(true);      // 信令默认 TLS；dev 自签
-        sc.setTrustAll(true);
+        // Never silently disable certificate verification for a remote production host.
+        sc.setTrustAll(Boolean.parseBoolean(System.getProperty(
+                "rc.client.trust-all", Boolean.toString(loopback))));
         List<Endpoint> stun = List.of(new Endpoint("stun.l.google.com", 19302));
         Path receiveDir = Path.of(System.getProperty("user.home"), "rc-received");
         return new RemoteControlClient(baseUrl, sc, stun, receiveDir, this);

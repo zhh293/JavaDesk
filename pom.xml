@@ -39,12 +39,20 @@
         <spring-boot.version>3.2.5</spring-boot.version>
         <mybatis-spring-boot.version>3.0.3</mybatis-spring-boot.version>
         <mysql-connector.version>8.3.0</mysql-connector.version>
+        <!-- Nacos 3.2.3 stable line: Relay ephemeral registration + signaling subscription. -->
+        <nacos-client.version>3.2.3</nacos-client.version>
 
         <!-- GUI（client） -->
         <javafx.version>21.0.2</javafx.version>
 
         <!-- QUIC（Phase 2，kwik 纯 Java QUIC v1） -->
-        <kwik.version>0.9.3</kwik.version>
+        <!-- 0.9.3 was never published to Maven Central; 0.9.1 is the latest
+             published 0.9.x release and keeps the intended compatibility line. -->
+        <kwik.version>0.9.1</kwik.version>
+
+        <!-- 测试基线 -->
+        <junit.version>5.10.2</junit.version>
+        <assertj.version>3.25.3</assertj.version>
 
         <!-- 采集/编码（Phase 2 富媒体：DXGI 抓屏 + H.264 软编） -->
         <jna.version>5.14.0</jna.version>
@@ -122,6 +130,12 @@
             </dependency>
 
             <dependency>
+                <groupId>com.alibaba.nacos</groupId>
+                <artifactId>nacos-client</artifactId>
+                <version>${nacos-client.version}</version>
+            </dependency>
+
+            <dependency>
                 <groupId>org.openjfx</groupId>
                 <artifactId>javafx-controls</artifactId>
                 <version>${javafx.version}</version>
@@ -173,6 +187,17 @@
                 <groupId>com.github.ben-manes.caffeine</groupId>
                 <artifactId>caffeine</artifactId>
                 <version>${caffeine.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.junit.jupiter</groupId>
+                <artifactId>junit-jupiter</artifactId>
+                <version>${junit.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.assertj</groupId>
+                <artifactId>assertj-core</artifactId>
+                <version>${assertj.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

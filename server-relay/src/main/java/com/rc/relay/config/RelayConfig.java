@@ -1,13 +1,11 @@
 package com.rc.relay.config;
 
-import java.nio.charset.StandardCharsets;
-
 /**
  * 中继服务器配置（plain main，无 Spring）。从系统属性 / 环境变量读取，缺省 dev 值。
  *
  * <p>同一节点可同时暴露 UDP / TCP(TLS) / WS 三个数据面端口，对应降级阶梯
- * {@code Relay-UDP → Relay-TCP/TLS → Relay-WS}。与信令服务器共享的 {@code secret}
- * 必须一致，否则令牌校验失败（生产经环境变量注入）。</p>
+ * {@code Relay-UDP → Relay-TCP/TLS → Relay-WS}。Relay 从信令内部接口刷新 Ed25519
+ * 公钥，只验证服务端下发的 assignment ticket。</p>
  *
  * <p>节点身份（{@code nodeId}/{@code region}/{@code advertiseHost}）用于向信令服务器
  * 心跳注册，供多地域就近调度；{@code signalingUrl} 为信令内部心跳接口。</p>
@@ -21,8 +19,8 @@ public final class RelayConfig {
     private final int metricsPort;
     private final boolean tls;
     private final String certFile;
+    private final String keyFile;
     private final String certPassword;
-    private final byte[] secret;
     private final long sessionTtlSeconds;
 
     private final String nodeId;
@@ -30,9 +28,19 @@ public final class RelayConfig {
     private final String advertiseHost;
     private final String signalingUrl;
     private final long heartbeatIntervalMs;
+    private final String internalServiceToken;
+    private final int capacity;
+    private final double bandwidthCapacityMbps;
+    private final boolean nacosEnabled;
+    private final String nacosServerAddr;
+    private final String nacosNamespace;
+    private final String nacosUsername;
+    private final String nacosPassword;
+    private final String nacosServiceName;
+    private final String nacosGroupName;
 
     private RelayConfig(String host, int udpPort, int tcpPort, int wsPort, int metricsPort, boolean tls,
-                        String certFile, String certPassword, byte[] secret, long sessionTtlSeconds,
+                        String certFile, String certPassword, long sessionTtlSeconds,
                         String nodeId, String region, String advertiseHost, String signalingUrl,
                         long heartbeatIntervalMs) {
         this.host = host;
@@ -42,14 +50,27 @@ public final class RelayConfig {
         this.metricsPort = metricsPort;
         this.tls = tls;
         this.certFile = certFile;
+        String configuredKeyFile = prop("rc.relay.key-file", "RC_RELAY_KEY_FILE", "");
+        this.keyFile = configuredKeyFile.isBlank() ? null : configuredKeyFile;
         this.certPassword = certPassword;
-        this.secret = secret;
         this.sessionTtlSeconds = sessionTtlSeconds;
         this.nodeId = nodeId;
         this.region = region;
         this.advertiseHost = advertiseHost;
         this.signalingUrl = signalingUrl;
         this.heartbeatIntervalMs = heartbeatIntervalMs;
+        this.internalServiceToken = prop("rc.relay.internal-service-token", "RC_INTERNAL_SERVICE_TOKEN",
+                "rc-internal-dev-token-change-me");
+        this.capacity = Integer.parseInt(prop("rc.relay.capacity", "RC_RELAY_CAPACITY", "1000"));
+        this.bandwidthCapacityMbps = Double.parseDouble(prop(
+                "rc.relay.bandwidth-capacity-mbps", "RC_RELAY_BANDWIDTH_CAPACITY_MBPS", "1000"));
+        this.nacosEnabled = Boolean.parseBoolean(prop("rc.relay.nacos-enabled", "RC_NACOS_ENABLED", "false"));
+        this.nacosServerAddr = prop("rc.relay.nacos-server-addr", "RC_NACOS_SERVER_ADDR", "127.0.0.1:8848");
+        this.nacosNamespace = prop("rc.relay.nacos-namespace", "RC_NACOS_NAMESPACE", "public");
+        this.nacosUsername = prop("rc.relay.nacos-username", "RC_NACOS_USERNAME", "nacos");
+        this.nacosPassword = prop("rc.relay.nacos-password", "RC_NACOS_PASSWORD", "nacos");
+        this.nacosServiceName = prop("rc.relay.nacos-service-name", "RC_NACOS_SERVICE_NAME", "javadesk-relay");
+        this.nacosGroupName = prop("rc.relay.nacos-group-name", "RC_NACOS_GROUP_NAME", "RELAY_GROUP");
     }
 
     public static RelayConfig fromEnv() {
@@ -61,7 +82,6 @@ public final class RelayConfig {
         boolean tls = Boolean.parseBoolean(prop("rc.relay.tls", "RC_RELAY_TLS", "false"));
         String certFile = prop("rc.relay.cert-file", "RC_RELAY_CERT_FILE", "");
         String certPassword = prop("rc.relay.cert-password", "RC_RELAY_CERT_PASSWORD", "");
-        String secret = prop("rc.relay.secret", "RC_RELAY_SECRET", "rc-relay-dev-secret-change-me");
         long ttl = Long.parseLong(prop("rc.relay.session-ttl-seconds", "RC_RELAY_SESSION_TTL_SECONDS", "120"));
 
         String nodeId = prop("rc.relay.node-id", "RC_RELAY_NODE_ID", "relay-1");
@@ -74,7 +94,7 @@ public final class RelayConfig {
         return new RelayConfig(host, udpPort, tcpPort, wsPort, metricsPort, tls,
                 certFile.isBlank() ? null : certFile,
                 certPassword.isBlank() ? null : certPassword,
-                secret.getBytes(StandardCharsets.UTF_8), ttl,
+                ttl,
                 nodeId, region, advertiseHost, signalingUrl, heartbeatMs);
     }
 
@@ -110,8 +130,8 @@ public final class RelayConfig {
         return certPassword;
     }
 
-    public byte[] secret() {
-        return secret;
+    public String keyFile() {
+        return keyFile;
     }
 
     public long sessionTtlSeconds() {
@@ -137,6 +157,20 @@ public final class RelayConfig {
     public long heartbeatIntervalMs() {
         return heartbeatIntervalMs;
     }
+
+    public String internalServiceToken() {
+        return internalServiceToken;
+    }
+
+    public int capacity() { return capacity; }
+    public double bandwidthCapacityMbps() { return bandwidthCapacityMbps; }
+    public boolean nacosEnabled() { return nacosEnabled; }
+    public String nacosServerAddr() { return nacosServerAddr; }
+    public String nacosNamespace() { return nacosNamespace; }
+    public String nacosUsername() { return nacosUsername; }
+    public String nacosPassword() { return nacosPassword; }
+    public String nacosServiceName() { return nacosServiceName; }
+    public String nacosGroupName() { return nacosGroupName; }
 
     private static String prop(String sysProp, String env, String def) {
         String value = System.getProperty(sysProp);

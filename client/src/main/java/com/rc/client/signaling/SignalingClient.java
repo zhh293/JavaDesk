@@ -122,10 +122,12 @@ public final class SignalingClient {
             return;
         }
         backoffMs = backoffMs == 0 ? 1000L : Math.min(backoffMs * 2, config.getReconnectBackoffMaxMs());
+        long delay = backoffMs <= 100 ? backoffMs
+                : java.util.concurrent.ThreadLocalRandom.current().nextLong(100, backoffMs + 1);
         reconnectExecutor.schedule(() -> {
             reconnectScheduled.set(false);
             connect();
-        }, backoffMs, TimeUnit.MILLISECONDS);
+        }, delay, TimeUnit.MILLISECONDS);
     }
 
     private SslContext buildSslContext() {

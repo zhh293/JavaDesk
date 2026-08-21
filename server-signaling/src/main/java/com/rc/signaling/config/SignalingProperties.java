@@ -16,8 +16,11 @@ public class SignalingProperties {
     /** 是否启用 TLS（dev 无证书时自动自签）。 */
     private boolean tls = true;
 
-    /** PKCS12 证书路径（可选，缺省用 Netty 自签证书）。 */
+    /** PEM 证书链路径（可选，缺省用 Netty 自签证书）。 */
     private String certFile;
+
+    /** PEM 私钥路径；配置 certFile 时必填。 */
+    private String keyFile;
 
     private String certPassword;
 
@@ -30,7 +33,7 @@ public class SignalingProperties {
     /** 心跳落库（last_online_at）节流间隔（秒），避免高频写库。 */
     private long heartbeatDbFlushSeconds = 30;
 
-    /** 中继服务器公网地址（就近调度占位，Phase 1 单节点静态配置）。 */
+    /** Development-only static Relay fallback; production candidates come from Nacos. */
     private String relayHost = "127.0.0.1";
 
     /** 中继 UDP 端口。 */
@@ -44,9 +47,6 @@ public class SignalingProperties {
 
     /** 中继端点是否启用 TLS（RELAY_TCP/RELAY_WS 时下发给客户端）。 */
     private boolean relayTls = false;
-
-    /** 中继令牌 HMAC 共享密钥（须与中继服务器一致，生产经环境变量注入）。 */
-    private String relaySecret = "rc-relay-dev-secret-change-me";
 
     public int getPort() {
         return port;
@@ -70,6 +70,14 @@ public class SignalingProperties {
 
     public void setCertFile(String certFile) {
         this.certFile = certFile;
+    }
+
+    public String getKeyFile() {
+        return keyFile;
+    }
+
+    public void setKeyFile(String keyFile) {
+        this.keyFile = keyFile;
     }
 
     public String getCertPassword() {
@@ -144,11 +152,4 @@ public class SignalingProperties {
         this.relayTls = relayTls;
     }
 
-    public String getRelaySecret() {
-        return relaySecret;
-    }
-
-    public void setRelaySecret(String relaySecret) {
-        this.relaySecret = relaySecret;
-    }
 }

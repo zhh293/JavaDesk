@@ -12,11 +12,11 @@ import org.bouncycastle.openssl.PEMParser;
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
-import tech.kwik.core.ClientConfig;
-import tech.kwik.core.Kwik;
-import tech.kwik.core.QuicConnection;
-import tech.kwik.core.QuicVersion;
-import tech.kwik.core.ServerConnector;
+import net.luminis.quic.QuicClientConnection;
+import net.luminis.quic.QuicConnection;
+import net.luminis.quic.server.ApplicationProtocolConnection;
+import net.luminis.quic.server.ApplicationProtocolConnectionFactory;
+import net.luminis.quic.server.ServerConnector;
 
 import java.io.StringReader;
 import java.math.BigInteger;
@@ -41,14 +41,11 @@ import java.util.concurrent.TimeoutException;
  * socket，保证 NAT 映射一致（设计文档 §1.4「同一 UDP Socket」）。</p>
  *
  * <p><b>socket 交接</b>：经 {@link UdpSocket#punchedDatagramSocket()} 把打洞 socket 的底层
- * {@link java.net.DatagramSocket} 交棒给 kwik（客户端经 {@code datagramSocketFactory} 注入，
- * 服务端经 {@code ServerConnector} 的 socket 工厂注入），而非让 kwik 另开 socket——否则
+ * {@link java.net.DatagramSocket} 交棒给 kwik（客户端经 {@code socketFactory} 注入，
+ * 服务端经 {@code ServerConnector.withSocket} 注入），而非让 kwik 另开 socket——否则
  * 映射端口改变、打洞失效。</p>
  *
- * <p><b>kwik API 未编译核对</b>：本类依赖的 {@code ServerConnector} 构造签名、TLS 传参
- * 方式（{@code withKeyStore} / {@code withCertificate}）与 datagram 工厂注入点在无 Maven/JDK17
- * 环境无法校验，均集中在 {@link #establishServer} / {@link #clientConfigFor} 两处并标注
- * 「待对照 javadoc」，接入时机械校正即可，其余逻辑不随 API 变动。</p>
+ * <p>本实现已按 kwik 0.9.1 的公开 API 校正，并显式启用 QUIC Datagram 扩展。</p>
  */
 public final class QuicTransportEndpoint {
 
@@ -93,40 +90,49 @@ public final class QuicTransportEndpoint {
 
     private static QuicConnection establishClient(UdpSocket socket, Endpoint peer) throws Exception {
         URI uri = URI.create("quic://" + peer.ip() + ":" + peer.port());
-        ClientConfig config = clientConfigFor(socket);
-        return Kwik.createClient(uri, QuicVersion.V1, config);
+        QuicClientConnection connection = clientBuilderFor(socket)
+                .uri(uri)
+                .build();
+        connection.connect();
+        return connection;
     }
 
     /**
      * 被控端充当 QUIC 服务端：以自签证书 + 私钥构建 KeyStore，经 {@link ServerConnector}
      * 把打洞 socket 注入（同一 fd），注册应用协议并阻塞等待首个握手成功的连接。
      *
-     * <p><b>待对照 javadoc</b>：{@code ServerConnector.builder()} 的 TLS 入参（{@code withKeyStore}
-     * 或 {@code withCertificate}）与 socket 工厂方法名（{@code datagramSocketFactory}）需按
-     * kwik 0.9.x 实际签名校正；{@code registerApplicationProtocol} 的回调类型若为
-     * {@code ServerConnectionRegistry}，其 {@code newConnection(ServerConnection, String)} 为
-     * SAM，下方 lambda 可直接匹配。</p>
+     * 使用 0.9.1 的 {@code withKeyStore}/{@code withSocket} 与应用协议连接工厂。
      */
     private static QuicConnection establishServer(UdpSocket socket, TlsMaterial tls) throws Exception {
         KeyStore keyStore = keyStoreFrom(tls);
         ServerConnector connector = ServerConnector.builder()
                 .withKeyStore(keyStore, KEYSTORE_ALIAS, KEYSTORE_PASSWORD)
-                .datagramSocketFactory(() -> socket.punchedDatagramSocket())
+                .withSupportedVersion(QuicConnection.QuicVersion.V1)
+                .withSocket(socket.punchedDatagramSocket())
                 .build();
 
         CompletableFuture<QuicConnection> accepted = new CompletableFuture<>();
-        connector.registerApplicationProtocol(APPLICATION_PROTOCOL, connection -> {
-            accepted.complete(connection.getQuicConnection());
+        connector.registerApplicationProtocol(APPLICATION_PROTOCOL, new ApplicationProtocolConnectionFactory() {
+            @Override
+            public ApplicationProtocolConnection createConnection(String protocol, QuicConnection connection) {
+                accepted.complete(connection);
+                return new ApplicationProtocolConnection() { };
+            }
+
+            @Override
+            public boolean enableDatagramExtension() {
+                return true;
+            }
         });
         connector.start();
 
         try {
             return accepted.get(HANDSHAKE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
-            connector.stop();
+            connector.close();
             throw new TimeoutException("quic server accept timeout");
         } catch (Exception e) {
-            connector.stop();
+            connector.close();
             throw e;
         }
     }
@@ -134,15 +140,16 @@ public final class QuicTransportEndpoint {
     /**
      * 构造客户端配置：应用层协议 + 超时 + <b>把打洞 socket 交给 kwik</b>。
      *
-     * <p><b>待对照 javadoc</b>：{@code datagramSocketFactory} 方法名与工厂接口形状需按 kwik
-     * 校正；语义为「返回已绑定打洞端口的 {@code DatagramSocket}，勿新开 socket」。</p>
+     * socket factory 返回已绑定打洞端口的 {@code DatagramSocket}，不会新开 socket。
      */
-    private static ClientConfig clientConfigFor(UdpSocket socket) {
-        return ClientConfig.builder()
+    private static QuicClientConnection.Builder clientBuilderFor(UdpSocket socket) {
+        return QuicClientConnection.newBuilder()
                 .applicationProtocol(APPLICATION_PROTOCOL)
                 .connectTimeout(Duration.ofMillis(HANDSHAKE_TIMEOUT_MS))
-                .datagramSocketFactory(() -> socket.punchedDatagramSocket())
-                .build();
+                .version(QuicConnection.QuicVersion.V1)
+                .noServerCertificateCheck()
+                .enableDatagramExtension()
+                .socketFactory(ignored -> socket.punchedDatagramSocket());
     }
 
     /**

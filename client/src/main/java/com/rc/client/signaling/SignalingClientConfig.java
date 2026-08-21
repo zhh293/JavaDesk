@@ -1,8 +1,8 @@
 package com.rc.client.signaling;
 
 /**
- * 信令客户端配置。dev 默认明文（{@code tls=false}）免自签证书信任问题；
- * prod 置 {@code tls=true}，配合 {@code trustAll=false} 校验正式证书。
+ * 信令客户端配置。桌面入口会启用 TLS：仅 loopback 开发地址默认信任自签证书，
+ * 远程地址默认 {@code trustAll=false} 并校验正式证书。
  */
 public class SignalingClientConfig {
 

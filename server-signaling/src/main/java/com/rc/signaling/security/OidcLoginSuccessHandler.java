@@ -16,17 +16,20 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * OIDC 登录成功处理器：把 IdP 返回的 {@link OidcUser} 映射为本地用户（按 {@code sub} → 无则建），
- * 签发本系统 JWT，并重定向回前端回调地址（{@code ssoRedirectUri}），以 query 携带
- * {@code access_token / refresh_token / expires_in}。后端保持无状态，后续 API 仍走 JWT。
+ * 签发本系统 JWT，并重定向回前端回调地址（{@code ssoRedirectUri}）。重定向 URL 只携带
+ * 60 秒内可消费一次的随机交接码，JWT 不进入浏览器历史、代理日志或 Referer。
  */
 @Component
 public class OidcLoginSuccessHandler implements AuthenticationSuccessHandler {
 
     private final AuthService authService;
+    private final AuthorizationHandoffService handoffService;
     private final SecurityProperties props;
 
-    public OidcLoginSuccessHandler(AuthService authService, SecurityProperties props) {
+    public OidcLoginSuccessHandler(AuthService authService, AuthorizationHandoffService handoffService,
+                                   SecurityProperties props) {
         this.authService = authService;
+        this.handoffService = handoffService;
         this.props = props;
     }
 
@@ -37,11 +40,11 @@ public class OidcLoginSuccessHandler implements AuthenticationSuccessHandler {
         String sub = oidcUser.getSubject();
         String username = preferredUsername(oidcUser);
         TokenResponse tokens = authService.loginViaSso(sub, username);
+        String handoffCode = handoffService.issue(tokens);
 
         String redirect = props.getSsoRedirectUri()
-                + "?access_token=" + encode(tokens.accessToken())
-                + "&refresh_token=" + encode(tokens.refreshToken())
-                + "&expires_in=" + tokens.expiresInSeconds();
+                + (props.getSsoRedirectUri().contains("?") ? "&" : "?")
+                + "code=" + encode(handoffCode);
         response.sendRedirect(redirect);
     }
 

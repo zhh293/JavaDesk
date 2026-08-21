@@ -11,5 +11,10 @@ public record RelayHeartbeatRequest(
         int tcpPort,
         int wsPort,
         boolean tls,
-        double loadRatio) {
+        double loadRatio,
+        int activeSessions,
+        int capacity,
+        double cpuRatio,
+        double bandwidthRatio,
+        double directMemoryRatio) {
 }

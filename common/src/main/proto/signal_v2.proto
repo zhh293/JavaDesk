@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package com.rc.common.protocol;
+option java_package = "com.rc.common.protocol.v2";
+option java_multiple_files = true;
+option java_outer_classname = "SignalV2Proto";
+option optimize_for = SPEED;
+
+import "signal.proto";
+
+message SignalEnvelopeV2 {
+  string protocol_version = 1;
+  string message_id = 2;
+  string causation_id = 3;
+  string trace_id = 4;
+  uint64 session_id = 5;
+  uint64 session_version = 6;
+  uint64 route_epoch = 7;
+  uint64 connection_epoch = 8;
+  uint64 seq = 9;
+  int64 sent_at_ms = 10;
+  int64 deadline_at_ms = 11;
+  bool ack_required = 12;
+
+  oneof body {
+    RegisterV2 register = 20;
+    RegisterAckV2 register_ack = 21;
+    ConnectionFenced connection_fenced = 22;
+    ResumeReq resume_req = 23;
+    ResumeResp resume_resp = 24;
+    CreateSessionReq create_session = 30;
+    SessionInvite session_invite = 31;
+    SessionInviteDecision invite_decision = 32;
+    SessionSnapshotReq snapshot_req = 33;
+    SessionSnapshotResp snapshot_resp = 34;
+    EndSessionReq end_session = 35;
+    RelaySwitchRequest relay_switch = 40;
+    RelayAssignment relay_assignment = 41;
+    RelayReady relay_ready = 42;
+    RouteCommit route_commit = 43;
+    RouteAbort route_abort = 44;
+    RouteRetire route_retire = 45;
+    SignalAck ack = 50;
+  }
+}
+
+message RegisterV2 {
+  string access_token = 1;
+  string device_code = 2;
+  string client_instance_id = 3;
+  string client_version = 4;
+  string min_protocol_version = 5;
+  string max_protocol_version = 6;
+  repeated string capabilities = 7;
+  bytes device_proof = 8;
+}
+
+message RegisterAckV2 {
+  uint64 device_id = 1;
+  string connection_id = 2;
+  uint64 connection_epoch = 3;
+  int64 server_time_ms = 4;
+  int64 heartbeat_interval_ms = 5;
+  int64 lease_ttl_ms = 6;
+}
+
+message ConnectionFenced { uint64 replacement_epoch = 1; }
+
+message ResumeReq {
+  string resume_ticket = 1;
+  repeated SessionResumePoint sessions = 2;
+}
+message SessionResumePoint {
+  uint64 session_id = 1;
+  uint64 committed_route_epoch = 2;
+  string last_ack_message_id = 3;
+}
+message ResumeResp { repeated SessionSnapshot snapshots = 1; }
+
+message CreateSessionReq {
+  string request_id = 1;
+  string target_device_code = 2;
+  bytes encrypted_invite_credential = 3;
+}
+message SessionInvite {
+  uint64 controller_device_id = 1;
+  bytes encrypted_invite_credential = 2;
+}
+message SessionInviteDecision {
+  string request_id = 1;
+  bool accepted = 2;
+  string reason = 3;
+}
+message SessionSnapshotReq { uint64 session_id = 1; }
+message SessionSnapshotResp { SessionSnapshot snapshot = 1; }
+message EndSessionReq { string request_id = 1; string reason = 2; int32 code = 3; }
+
+enum RouteStateV2 { ROUTE_STATE_UNKNOWN = 0; PREPARING = 1; COMMITTED = 2; ABORTED = 3; }
+enum PeerRoleV2 { PEER_ROLE_UNKNOWN = 0; CONTROLLER = 1; AGENT = 2; }
+
+message RouteSnapshot {
+  uint64 route_epoch = 1;
+  RouteStateV2 state = 2;
+  com.rc.common.protocol.PathType path_type = 3;
+  string relay_node_id = 4;
+  string relay_host = 5;
+  int32 relay_port = 6;
+  bool tls = 7;
+  string assignment_id = 8;
+  uint64 base_epoch = 9;
+  bool controller_ready = 10;
+  bool agent_ready = 11;
+  int64 deadline_at_ms = 12;
+  int64 committed_at_ms = 13;
+  string failure_reason = 14;
+}
+message SessionSnapshot {
+  uint64 session_id = 1;
+  uint64 session_version = 2;
+  string session_state = 3;
+  RouteSnapshot committed_route = 4;
+  RouteSnapshot preparing_route = 5;
+  string end_reason = 6;
+  int32 end_code = 7;
+}
+
+message RelaySwitchRequest {
+  string request_id = 1;
+  uint64 base_epoch = 2;
+  string failed_relay_node_id = 3;
+  com.rc.common.protocol.PathType path_type = 4;
+  string failure_type = 5;
+  bytes qos_summary = 6;
+}
+message RelayEndpointV2 {
+  string relay_node_id = 1;
+  string host = 2;
+  int32 port = 3;
+  bool tls = 4;
+  com.rc.common.protocol.PathType path_type = 5;
+}
+message RelayAssignment {
+  string assignment_id = 1;
+  uint64 route_epoch = 2;
+  RelayEndpointV2 endpoint = 3;
+  string relay_ticket = 4;
+  PeerRoleV2 role = 5;
+  int64 deadline_at_ms = 6;
+}
+message RelayReady {
+  string request_id = 1;
+  string assignment_id = 2;
+  uint64 route_epoch = 3;
+  bytes peer_ready_proof = 4;
+}
+message RouteCommit { RouteSnapshot route = 1; }
+message RouteAbort { RouteSnapshot route = 1; }
+message RouteRetire { uint64 route_epoch = 1; }
+message SignalAck { string acked_message_id = 1; string level = 2; }

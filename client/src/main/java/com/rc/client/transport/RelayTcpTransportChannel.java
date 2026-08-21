@@ -2,7 +2,9 @@ package com.rc.client.transport;
 
 import com.rc.common.codec.DataFrame;
 import com.rc.common.codec.DataFrameCodec;
-import com.rc.common.codec.RelayPacketCodec;
+import com.rc.common.codec.RelayJoinPayloadV2;
+import com.rc.common.codec.RelayPacketCodecV2;
+import com.rc.common.crypto.RelayTicketV2.PeerRole;
 import com.rc.common.constant.ChannelType;
 import com.rc.common.constant.FrameFlags;
 import com.rc.common.constant.FrameType;
@@ -47,7 +49,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * 中继 TCP（可选 TLS）数据面：连接中继 TCP 端口，把 DataFrame 密文透传给对端。
  *
- * <p>帧格式为「4 字节长度前缀 + {@link RelayPacketCodec} 裸包」。建链时发 JOIN（一次性
+ * <p>帧格式为「4 字节长度前缀 + {@link RelayPacketCodecV2} 裸包」。建链时发 JOIN（一次性
  * 令牌），中继校验后绑定会话两端；JOIN 未确认前周期重发，确认后切心跳保活。
  * 与 {@link RelayTransportChannel}（UDP）一致，会话密钥（AES-256-GCM）暂存待 E2EE 启用。</p>
  */
@@ -59,7 +61,10 @@ public final class RelayTcpTransportChannel implements TransportChannel {
 
     private final Endpoint relay;
     private final long sessionId;
-    private final String token;
+    private final long routeEpoch;
+    private final PeerRole role;
+    private final String ticket;
+    private final String connectionNonce;
     private final byte[] sessionKey;
     private final boolean tls;
     private final boolean trustAll;
@@ -73,11 +78,15 @@ public final class RelayTcpTransportChannel implements TransportChannel {
     private volatile boolean closed;
     private volatile long lastHeartbeat;
 
-    public RelayTcpTransportChannel(Endpoint relay, long sessionId, String token, byte[] sessionKey,
+    public RelayTcpTransportChannel(Endpoint relay, long sessionId, long routeEpoch, PeerRole role,
+                                    String ticket, String connectionNonce, byte[] sessionKey,
                                     boolean tls, boolean trustAll) {
         this.relay = relay;
         this.sessionId = sessionId;
-        this.token = token;
+        this.routeEpoch = routeEpoch;
+        this.role = role;
+        this.ticket = ticket;
+        this.connectionNonce = connectionNonce;
         this.sessionKey = sessionKey;
         this.tls = tls;
         this.trustAll = trustAll;
@@ -145,7 +154,7 @@ public final class RelayTcpTransportChannel implements TransportChannel {
             DataFrameCodec.encode(frame, buf);
             byte[] frameBytes = new byte[buf.readableBytes()];
             buf.readBytes(frameBytes);
-            byte[] packet = RelayPacketCodec.data(sessionId, frameBytes);
+            byte[] packet = packet(RelayPacketCodecV2.Type.DATA, seq.incrementAndGet(), frameBytes);
             channel.writeAndFlush(Unpooled.wrappedBuffer(packet));
         } finally {
             ReferenceCountUtil.release(buf);
@@ -188,23 +197,14 @@ public final class RelayTcpTransportChannel implements TransportChannel {
     }
 
     private void sendJoin() {
-        channel.writeAndFlush(Unpooled.wrappedBuffer(RelayPacketCodec.join(sessionId, token)));
+        channel.writeAndFlush(Unpooled.wrappedBuffer(packet(RelayPacketCodecV2.Type.JOIN, 0,
+                new RelayJoinPayloadV2(ticket, connectionNonce).encode())));
     }
 
     private void sendHeartbeat() {
         lastHeartbeat = System.currentTimeMillis();
-        DataFrame heartbeat = new DataFrame(ChannelType.CONTROL, FrameType.HEARTBEAT,
-                FrameFlags.NONE, seq.getAndIncrement(), System.currentTimeMillis(), new byte[0]);
-        ByteBuf buf = Unpooled.buffer(ProtocolConstants.DATA_FRAME_HEADER_SIZE);
-        try {
-            DataFrameCodec.encode(heartbeat, buf);
-            byte[] frameBytes = new byte[buf.readableBytes()];
-            buf.readBytes(frameBytes);
-            byte[] packet = RelayPacketCodec.data(sessionId, frameBytes);
-            channel.writeAndFlush(Unpooled.wrappedBuffer(packet));
-        } finally {
-            ReferenceCountUtil.release(buf);
-        }
+        channel.writeAndFlush(Unpooled.wrappedBuffer(packet(RelayPacketCodecV2.Type.PING,
+                seq.incrementAndGet(), new byte[0])));
     }
 
     private SslContext buildSslContext() {
@@ -224,18 +224,17 @@ public final class RelayTcpTransportChannel implements TransportChannel {
         protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
             byte[] data = new byte[msg.readableBytes()];
             msg.readBytes(data);
-            ReferenceCountUtil.release(msg);
-
-            RelayPacketCodec.Packet pkt = RelayPacketCodec.decode(data);
-            if (pkt == null) {
-                return;
-            }
-            if (pkt.type() == RelayPacketCodec.TYPE_JOIN_ACK) {
+            RelayPacketCodecV2.Packet pkt;
+            try { pkt = RelayPacketCodecV2.decode(data); } catch (IllegalArgumentException malformed) { return; }
+            if (!matchesAssignment(pkt)) return;
+            if (pkt.type() == RelayPacketCodecV2.Type.JOIN_ACCEPTED) {
                 if (!joined.isDone()) {
                     log.info("relay tcp joined, session={}", sessionId);
                     joined.complete(null);
                 }
-            } else if (pkt.type() == RelayPacketCodec.TYPE_DATA) {
+            } else if (pkt.type() == RelayPacketCodecV2.Type.JOIN_REJECTED) {
+                joined.completeExceptionally(new SecurityException("relay rejected assignment ticket"));
+            } else if (pkt.type() == RelayPacketCodecV2.Type.DATA) {
                 onData(pkt.payload());
             }
         }
@@ -245,6 +244,16 @@ public final class RelayTcpTransportChannel implements TransportChannel {
             log.warn("relay tcp exception", cause);
             ctx.close();
         }
+    }
+
+    private byte[] packet(RelayPacketCodecV2.Type type, long sequence, byte[] payload) {
+        return RelayPacketCodecV2.encode(new RelayPacketCodecV2.Packet(type, 0, sessionId, routeEpoch,
+                PathType.RELAY_TCP, role, sequence, payload));
+    }
+
+    private boolean matchesAssignment(RelayPacketCodecV2.Packet packet) {
+        return packet.sessionId() == sessionId && packet.routeEpoch() == routeEpoch
+                && packet.pathType() == PathType.RELAY_TCP && packet.role() == role;
     }
 
     private void onData(byte[] frameBytes) {

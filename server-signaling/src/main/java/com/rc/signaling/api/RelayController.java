@@ -39,7 +39,8 @@ public class RelayController {
         node.setWsPort(req.wsPort());
         node.setTls(req.tls());
         node.setLoadRatio(req.loadRatio());
-        relayManager.heartbeat(node);
+        relayManager.heartbeat(node, req.activeSessions(), req.capacity(), req.cpuRatio(),
+                req.bandwidthRatio(), req.directMemoryRatio());
         return ApiResult.ok();
     }
 

@@ -2,7 +2,9 @@ package com.rc.client.transport;
 
 import com.rc.common.codec.DataFrame;
 import com.rc.common.codec.DataFrameCodec;
-import com.rc.common.codec.RelayPacketCodec;
+import com.rc.common.codec.RelayJoinPayloadV2;
+import com.rc.common.codec.RelayPacketCodecV2;
+import com.rc.common.crypto.RelayTicketV2.PeerRole;
 import com.rc.common.constant.ChannelType;
 import com.rc.common.constant.FrameFlags;
 import com.rc.common.constant.FrameType;
@@ -53,7 +55,10 @@ public final class RelayTransportChannel implements TransportChannel {
 
     private final Endpoint relay;
     private final long sessionId;
-    private final String token;
+    private final long routeEpoch;
+    private final PeerRole role;
+    private final String ticket;
+    private final String connectionNonce;
     private final byte[] sessionKey;
     private final EventLoopGroup group;
     private final Channel channel;
@@ -65,10 +70,14 @@ public final class RelayTransportChannel implements TransportChannel {
     private volatile boolean closed;
     private volatile long lastHeartbeat;
 
-    public RelayTransportChannel(Endpoint relay, long sessionId, String token, byte[] sessionKey) {
+    public RelayTransportChannel(Endpoint relay, long sessionId, long routeEpoch, PeerRole role,
+                                 String ticket, String connectionNonce, byte[] sessionKey) {
         this.relay = relay;
         this.sessionId = sessionId;
-        this.token = token;
+        this.routeEpoch = routeEpoch;
+        this.role = role;
+        this.ticket = ticket;
+        this.connectionNonce = connectionNonce;
         this.sessionKey = sessionKey;
         this.group = new NioEventLoopGroup(1, new DefaultThreadFactory("rc-relay-udp", true));
         this.timer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -120,7 +129,7 @@ public final class RelayTransportChannel implements TransportChannel {
             DataFrameCodec.encode(frame, buf);
             byte[] frameBytes = new byte[buf.readableBytes()];
             buf.readBytes(frameBytes);
-            byte[] packet = RelayPacketCodec.data(sessionId, frameBytes);
+            byte[] packet = packet(RelayPacketCodecV2.Type.DATA, seq.incrementAndGet(), frameBytes);
             channel.writeAndFlush(new DatagramPacket(Unpooled.wrappedBuffer(packet),
                     new InetSocketAddress(relay.ip(), relay.port())));
         } finally {
@@ -164,26 +173,17 @@ public final class RelayTransportChannel implements TransportChannel {
     }
 
     private void sendJoin() {
-        byte[] packet = RelayPacketCodec.join(sessionId, token);
+        byte[] packet = packet(RelayPacketCodecV2.Type.JOIN, 0,
+                new RelayJoinPayloadV2(ticket, connectionNonce).encode());
         channel.writeAndFlush(new DatagramPacket(Unpooled.wrappedBuffer(packet),
                 new InetSocketAddress(relay.ip(), relay.port())));
     }
 
     private void sendHeartbeat() {
         lastHeartbeat = System.currentTimeMillis();
-        DataFrame heartbeat = new DataFrame(ChannelType.CONTROL, FrameType.HEARTBEAT,
-                FrameFlags.NONE, seq.getAndIncrement(), System.currentTimeMillis(), new byte[0]);
-        ByteBuf buf = Unpooled.buffer(ProtocolConstants.DATA_FRAME_HEADER_SIZE);
-        try {
-            DataFrameCodec.encode(heartbeat, buf);
-            byte[] frameBytes = new byte[buf.readableBytes()];
-            buf.readBytes(frameBytes);
-            byte[] packet = RelayPacketCodec.data(sessionId, frameBytes);
-            channel.writeAndFlush(new DatagramPacket(Unpooled.wrappedBuffer(packet),
-                    new InetSocketAddress(relay.ip(), relay.port())));
-        } finally {
-            ReferenceCountUtil.release(buf);
-        }
+        byte[] packet = packet(RelayPacketCodecV2.Type.PING, seq.incrementAndGet(), new byte[0]);
+        channel.writeAndFlush(new DatagramPacket(Unpooled.wrappedBuffer(packet),
+                new InetSocketAddress(relay.ip(), relay.port())));
     }
 
     private final class RelayHandler extends SimpleChannelInboundHandler<DatagramPacket> {
@@ -192,18 +192,17 @@ public final class RelayTransportChannel implements TransportChannel {
         protected void channelRead0(ChannelHandlerContext ctx, DatagramPacket packet) {
             byte[] data = new byte[packet.content().readableBytes()];
             packet.content().readBytes(data);
-            ReferenceCountUtil.release(packet);
-
-            RelayPacketCodec.Packet pkt = RelayPacketCodec.decode(data);
-            if (pkt == null) {
-                return;
-            }
-            if (pkt.type() == RelayPacketCodec.TYPE_JOIN_ACK) {
+            RelayPacketCodecV2.Packet pkt;
+            try { pkt = RelayPacketCodecV2.decode(data); } catch (IllegalArgumentException malformed) { return; }
+            if (!matchesAssignment(pkt)) return;
+            if (pkt.type() == RelayPacketCodecV2.Type.JOIN_ACCEPTED) {
                 if (!joined.isDone()) {
                     log.info("relay joined, session={}", sessionId);
                     joined.complete(null);
                 }
-            } else if (pkt.type() == RelayPacketCodec.TYPE_DATA) {
+            } else if (pkt.type() == RelayPacketCodecV2.Type.JOIN_REJECTED) {
+                joined.completeExceptionally(new SecurityException("relay rejected assignment ticket"));
+            } else if (pkt.type() == RelayPacketCodecV2.Type.DATA) {
                 onData(pkt.payload());
             }
         }
@@ -213,6 +212,16 @@ public final class RelayTransportChannel implements TransportChannel {
             log.warn("relay udp exception", cause);
             ctx.close();
         }
+    }
+
+    private byte[] packet(RelayPacketCodecV2.Type type, long sequence, byte[] payload) {
+        return RelayPacketCodecV2.encode(new RelayPacketCodecV2.Packet(type, 0, sessionId, routeEpoch,
+                PathType.RELAY_UDP, role, sequence, payload));
+    }
+
+    private boolean matchesAssignment(RelayPacketCodecV2.Packet packet) {
+        return packet.sessionId() == sessionId && packet.routeEpoch() == routeEpoch
+                && packet.pathType() == PathType.RELAY_UDP && packet.role() == role;
     }
 
     private void onData(byte[] frameBytes) {

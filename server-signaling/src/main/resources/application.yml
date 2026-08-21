@@ -21,22 +21,6 @@ spring:
       host: localhost
       port: 6379
       database: 0
-  security:
-    oauth2:
-      client:
-        registration:
-          enterprise-sso:
-            # 企业 SSO / OIDC 授权码流配置（Phase 3 落地，当前不生效）
-            provider: enterprise
-            client-id: change-me
-            client-secret: change-me
-            authorization-grant-type: authorization_code
-            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
-            scope: openid,profile,email
-        provider:
-          enterprise:
-            issuer-uri: https://sso.example.com
-
 mybatis:
   configuration:
     map-underscore-to-camel-case: true
@@ -53,6 +37,14 @@ management:
 
 # 信令长连接（Netty）与安全配置
 rc:
+  nacos:
+    enabled: false
+    server-addr: ${RC_NACOS_SERVER_ADDR:127.0.0.1:8848}
+    namespace: ${RC_NACOS_NAMESPACE:public}
+    username: ${RC_NACOS_USERNAME:nacos}
+    password: ${RC_NACOS_PASSWORD:nacos}
+    service-name: javadesk-relay
+    group-name: RELAY_GROUP
   signaling:
     port: 8443
     tls: true                 # dev 无证书时自动自签
@@ -61,10 +53,16 @@ rc:
     heartbeat-db-flush-seconds: 30
     relay-host: 127.0.0.1     # 中继服务器地址（Phase 1 静态单节点）
     relay-port: 9090
-    relay-secret: ${RC_RELAY_SECRET:rc-relay-dev-secret-change-me}
   security:
     jwt-secret: ${RC_JWT_SECRET:rc-signaling-dev-secret-change-me-in-prod-0123456789}
     access-token-ttl-seconds: 900
     refresh-token-ttl-seconds: 604800
-    # SSO/OIDC 登录成功后重定向回前端回调地址（携带 JWT query 参数）
+    internal-service-token: ${RC_INTERNAL_SERVICE_TOKEN:rc-internal-dev-token-change-me}
+    relay-ticket-private-key: ${RC_RELAY_TICKET_PRIVATE_KEY:}
+    relay-ticket-public-key: ${RC_RELAY_TICKET_PUBLIC_KEY:}
+    relay-ticket-key-id: ${RC_RELAY_TICKET_KEY_ID:relay-ticket-dev-1}
+    relay-ticket-issuer: ${RC_RELAY_TICKET_ISSUER:javadesk-signaling}
+    relay-ticket-previous-key-id: ${RC_RELAY_TICKET_PREVIOUS_KEY_ID:}
+    relay-ticket-previous-public-key: ${RC_RELAY_TICKET_PREVIOUS_PUBLIC_KEY:}
+    # SSO/OIDC 登录成功后重定向回前端回调地址（仅携带 60 秒一次性交接码）
     sso-redirect-uri: ${RC_SSO_REDIRECT_URI:http://localhost:3000/sso/callback}

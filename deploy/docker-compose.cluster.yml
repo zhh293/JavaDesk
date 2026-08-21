@@ -1,0 +1,134 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: rc_remote
+      MYSQL_USER: rc
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ../server-signaling/src/main/resources/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  nacos:
+    image: nacos/nacos-server:v3.2.3
+    environment:
+      MODE: standalone
+      NACOS_AUTH_ENABLE: "true"
+      NACOS_AUTH_IDENTITY_KEY: ${NACOS_IDENTITY_KEY:?set NACOS_IDENTITY_KEY}
+      NACOS_AUTH_IDENTITY_VALUE: ${NACOS_IDENTITY_VALUE:?set NACOS_IDENTITY_VALUE}
+      NACOS_AUTH_TOKEN: ${NACOS_AUTH_TOKEN:?set a Base64 token of at least 32 bytes}
+    ports: ["8848:8848"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8848/nacos/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  signaling-1: &signaling
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.signaling
+    environment: &signaling-env
+      MYSQL_HOST: mysql
+      MYSQL_DB: rc_remote
+      MYSQL_USER: rc
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      RC_NACOS_SERVER_ADDR: nacos:8848
+      RC_NACOS_NAMESPACE: public
+      RC_NACOS_USERNAME: ${NACOS_USERNAME:?set NACOS_USERNAME}
+      RC_NACOS_PASSWORD: ${NACOS_PASSWORD:?set NACOS_PASSWORD}
+      RC_JWT_SECRET: ${RC_JWT_SECRET:?set RC_JWT_SECRET}
+      RC_INTERNAL_SERVICE_TOKEN: ${RC_INTERNAL_SERVICE_TOKEN:?set RC_INTERNAL_SERVICE_TOKEN}
+      RC_RELAY_TICKET_PRIVATE_KEY: ${RC_RELAY_TICKET_PRIVATE_KEY:?Base64 PKCS8 Ed25519 private key}
+      RC_RELAY_TICKET_PUBLIC_KEY: ${RC_RELAY_TICKET_PUBLIC_KEY:?Base64 X509 Ed25519 public key}
+      RC_RELAY_TICKET_KEY_ID: ${RC_RELAY_TICKET_KEY_ID:-relay-ticket-1}
+      RC_SIGNALING_NODE_ID: signaling-1
+      RC_SIGNALING_TLS: "true"
+      RC_SIGNALING_CERT_FILE: /run/tls/signaling.crt
+      RC_SIGNALING_KEY_FILE: /run/tls/signaling.key
+    volumes:
+      - ${RC_SIGNALING_CERT_FILE:?set RC_SIGNALING_CERT_FILE}:/run/tls/signaling.crt:ro
+      - ${RC_SIGNALING_KEY_FILE:?set RC_SIGNALING_KEY_FILE}:/run/tls/signaling.key:ro
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      nacos: {condition: service_healthy}
+
+  signaling-2:
+    <<: *signaling
+    environment:
+      <<: *signaling-env
+      RC_SIGNALING_NODE_ID: signaling-2
+
+  relay-1: &relay
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.relay
+    environment: &relay-env
+      RC_RELAY_NODE_ID: relay-1
+      RC_RELAY_REGION: cn-east
+      RC_RELAY_ADVERTISE_HOST: ${RELAY_ADVERTISE_HOST:-127.0.0.1}
+      RC_RELAY_PORT: 19090
+      RC_RELAY_TCP_PORT: 19091
+      RC_RELAY_WS_PORT: 19092
+      RC_RELAY_SIGNALING_URL: http://gateway:8080/internal/relay-nodes/heartbeat
+      RC_INTERNAL_SERVICE_TOKEN: ${RC_INTERNAL_SERVICE_TOKEN}
+      RC_NACOS_ENABLED: "true"
+      RC_NACOS_SERVER_ADDR: nacos:8848
+      RC_NACOS_NAMESPACE: public
+      RC_NACOS_USERNAME: ${NACOS_USERNAME}
+      RC_NACOS_PASSWORD: ${NACOS_PASSWORD}
+      RC_RELAY_CAPACITY: 1000
+      RC_RELAY_BANDWIDTH_CAPACITY_MBPS: 1000
+    depends_on:
+      nacos: {condition: service_healthy}
+      gateway: {condition: service_started}
+    ports:
+      - "19090:19090/udp"
+      - "19091:19091"
+      - "19092:19092"
+      - "19093:9093"
+
+  relay-2:
+    <<: *relay
+    environment:
+      <<: *relay-env
+      RC_RELAY_NODE_ID: relay-2
+      RC_RELAY_PORT: 29090
+      RC_RELAY_TCP_PORT: 29091
+      RC_RELAY_WS_PORT: 29092
+    ports:
+      - "29090:29090/udp"
+      - "29091:29091"
+      - "29092:29092"
+      - "29093:9093"
+
+  gateway:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    depends_on: [signaling-1, signaling-2]
+
+volumes:
+  mysql-data:
+  redis-data:

@@ -63,10 +63,19 @@ message Signal {
 
     RelayAllocReq relay_alloc_req = 40;
     RelayAllocResp relay_alloc_resp = 41;
+    RelayFailureReport relay_failure_report = 42;
+    RelayAssignmentV2 relay_assignment_v2 = 43;
+    RelayReadyV2 relay_ready_v2 = 44;
+    RouteCommitV2 route_commit_v2 = 45;
+    RouteAbortV2 route_abort_v2 = 46;
+    RouteRetireV2 route_retire_v2 = 47;
 
     PathSwitchNotify path_switch = 50;
 
     SessionEnd session_end = 60;
+
+    SessionSnapshotReqV2 session_snapshot_req_v2 = 70;
+    SessionSnapshotRespV2 session_snapshot_resp_v2 = 71;
   }
 }
 
@@ -81,6 +90,10 @@ message RegisterReq {
   NatType nat_type = 6;               // 上报推断的 NAT 类型
   string token = 7;                   // JWT 访问令牌（长连接鉴权，来自 REST 登录）
   string public_key = 8;              // 设备公钥（Base64 X.509，E2EE 邀请流用）
+  string client_instance_id = 9;      // 一次客户端进程生命周期稳定，用于连接 fencing
+  string min_protocol_version = 10;
+  string max_protocol_version = 11;
+  repeated string capabilities = 12;
 }
 
 message RegisterResp {
@@ -90,6 +103,9 @@ message RegisterResp {
   uint64 device_id = 4;
   string signaling_node_id = 5;       // 承载本连接的信令节点 ID
   int64 server_time = 6;              // 服务端时间（时间同步）
+  string connection_id = 7;
+  uint64 connection_epoch = 8;
+  string negotiated_protocol_version = 9;
 }
 
 message Heartbeat {
@@ -149,6 +165,92 @@ message RelayAllocResp {
   int64 token_ttl_seconds = 8;
   PathType path_type = 9;
   bool tls = 10;                      // 中继端点是否 TLS（RELAY_TCP/RELAY_WS 时有效）
+}
+
+// ---------- V2 服务端仲裁的 Relay 迁移 ----------
+
+enum RelayPeerRole {
+  RELAY_ROLE_UNKNOWN = 0;
+  RELAY_ROLE_CONTROLLER = 1;
+  RELAY_ROLE_AGENT = 2;
+}
+
+message RelayFailureReport {
+  uint64 session_id = 1;
+  uint64 route_epoch = 2;
+  string assignment_id = 3;
+  string relay_node_id = 4;
+  PathType path_type = 5;
+  string failure_type = 6;
+  uint32 attempt_count = 7;
+  uint32 observed_rtt_ms = 8;
+  float observed_loss_rate = 9;
+  int64 first_failure_at = 10;
+  int64 last_failure_at = 11;
+  string region = 12;
+  string network_provider = 13;
+  string request_id = 14;
+}
+
+message RelayEndpointAssignment {
+  string relay_node_id = 1;
+  string host = 2;
+  int32 port = 3;
+  bool tls = 4;
+  PathType path_type = 5;
+}
+
+message RelayAssignmentV2 {
+  uint64 session_id = 1;
+  uint64 route_epoch = 2;
+  uint64 base_epoch = 3;
+  string assignment_id = 4;
+  RelayEndpointAssignment endpoint = 5;
+  string relay_ticket = 6;
+  RelayPeerRole role = 7;
+  int64 deadline_at = 8;
+  string request_id = 9;
+}
+
+message RelayReadyV2 {
+  uint64 session_id = 1;
+  uint64 route_epoch = 2;
+  string assignment_id = 3;
+  string request_id = 4;
+}
+
+message RouteCommitV2 {
+  uint64 session_id = 1;
+  uint64 route_epoch = 2;
+  string assignment_id = 3;
+  RelayEndpointAssignment endpoint = 4;
+}
+
+message RouteAbortV2 {
+  uint64 session_id = 1;
+  uint64 route_epoch = 2;
+  string assignment_id = 3;
+  string reason = 4;
+}
+
+message RouteRetireV2 {
+  uint64 session_id = 1;
+  uint64 route_epoch = 2;
+}
+
+message SessionSnapshotReqV2 { uint64 session_id = 1; }
+message SessionSnapshotRespV2 {
+  uint64 session_id = 1;
+  uint64 session_version = 2;
+  string session_state = 3;
+  uint64 committed_route_epoch = 4;
+  string committed_assignment_id = 5;
+  RelayEndpointAssignment committed_endpoint = 6;
+  uint64 preparing_route_epoch = 7;
+  string preparing_assignment_id = 8;
+  RelayEndpointAssignment preparing_endpoint = 9;
+  string end_reason = 10;
+  int32 end_code = 11;
 }
 
 // ---------- 降级 / 回切通知 ----------

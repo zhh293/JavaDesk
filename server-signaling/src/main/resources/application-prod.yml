@@ -16,9 +16,26 @@ spring:
       database: 0
 
 rc:
+  nacos:
+    enabled: true
+    server-addr: ${RC_NACOS_SERVER_ADDR}
+    namespace: ${RC_NACOS_NAMESPACE}
+    username: ${RC_NACOS_USERNAME}
+    password: ${RC_NACOS_PASSWORD}
+    service-name: ${RC_NACOS_SERVICE_NAME:javadesk-relay}
+    group-name: ${RC_NACOS_GROUP_NAME:RELAY_GROUP}
   signaling:
     node-id: ${RC_SIGNALING_NODE_ID:node-1}
+    tls: ${RC_SIGNALING_TLS:true}
     cert-file: ${RC_SIGNALING_CERT_FILE:}
+    key-file: ${RC_SIGNALING_KEY_FILE:}
     cert-password: ${RC_SIGNALING_CERT_PASSWORD:}
   security:
     jwt-secret: ${RC_JWT_SECRET}   # prod 必须注入，无默认值（启动即校验）
+    internal-service-token: ${RC_INTERNAL_SERVICE_TOKEN}
+    relay-ticket-private-key: ${RC_RELAY_TICKET_PRIVATE_KEY}
+    relay-ticket-public-key: ${RC_RELAY_TICKET_PUBLIC_KEY}
+    relay-ticket-key-id: ${RC_RELAY_TICKET_KEY_ID}
+    relay-ticket-issuer: ${RC_RELAY_TICKET_ISSUER:javadesk-signaling}
+    relay-ticket-previous-key-id: ${RC_RELAY_TICKET_PREVIOUS_KEY_ID:}
+    relay-ticket-previous-public-key: ${RC_RELAY_TICKET_PREVIOUS_PUBLIC_KEY:}
